@@ -2,13 +2,14 @@ import os
 import asyncio
 import requests
 from datetime import date
+from collections import defaultdict
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
-# --- Загрузка переменных окружения ---
+# === Загрузка .env ===
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 META_TOKEN = os.getenv("META_ACCESS_TOKEN")
@@ -17,63 +18,56 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# === API ===
-
-def get_ad_accounts():
-    """Получение всех рекламных аккаунтов"""
-    url = "https://graph.facebook.com/v19.0/me/adaccounts"
-    params = {
-        "fields": "name,account_id,account_status",
-        "access_token": META_TOKEN
-    }
-    r = requests.get(url, params=params).json()
-    return r.get("data", [])
-
-def get_campaigns(ad_account_id):
-    """Получение всех кампаний рекламного аккаунта"""
-    url = f"https://graph.facebook.com/v19.0/{ad_account_id}/campaigns"
-    params = {
-        "fields": "id,name,status,daily_budget",
-        "access_token": META_TOKEN
-    }
-    r = requests.get(url, params=params).json()
-    return r.get("data", [])
-
-def get_active_adsets(campaign_id):
-    """Получение активных adset кампании"""
-    url = f"https://graph.facebook.com/v19.0/{campaign_id}/adsets"
-    params = {
-        "fields": "id,name,effective_status",
-        "access_token": META_TOKEN
-    }
-    r = requests.get(url, params=params).json()
-    adsets = r.get("data", [])
-    return [a for a in adsets if a.get("effective_status") == "ACTIVE"]
-
-def get_campaign_insights(campaign_id):
-    """Метрики кампании (расход, лиды, CPL)"""
+# === Запрос активных групп через Insights ===
+def get_active_campaigns(ad_account_id):
     today = date.today().strftime("%Y-%m-%d")
-    url = f"https://graph.facebook.com/v19.0/{campaign_id}/insights"
+    url = f"https://graph.facebook.com/v19.0/{ad_account_id}/insights"
     params = {
-        "fields": "spend,actions",
-        "time_range": f"{{'since':'{today}','until':'{today}'}}",
+        "fields": "campaign_id,campaign_name,spend,actions",
+        "level": "adset",
+        "filtering": '[{"field":"adset.effective_status","operator":"IN","value":["ACTIVE"]}]',
+        "time_range": f'{{"since":"{today}","until":"{today}"}}',
         "access_token": META_TOKEN
     }
     r = requests.get(url, params=params).json()
     data = r.get("data", [])
     if not data:
-        return {"spend": 0, "leads": 0, "cpl": 0}
-    spend = float(data[0].get("spend", 0))
-    actions = data[0].get("actions", [])
-    leads = 0
-    for action in actions:
-        if action.get("action_type") == "lead":
-            leads = int(action.get("value", 0))
-    cpl = round(spend / leads, 2) if leads > 0 else 0
-    return {"spend": spend, "leads": leads, "cpl": cpl}
+        return []
+
+    campaigns = defaultdict(lambda: {"spend": 0.0, "leads": 0})
+    for row in data:
+        cid = row["campaign_id"]
+        cname = row["campaign_name"]
+        spend = float(row.get("spend", 0))
+        leads = 0
+        for action in row.get("actions", []):
+            if action["action_type"] == "lead":
+                leads += int(action["value"])
+        campaigns[cid]["name"] = cname
+        campaigns[cid]["spend"] += spend
+        campaigns[cid]["leads"] += leads
+
+    # Формируем список с CPL
+    result = []
+    for cid, stats in campaigns.items():
+        cpl = round(stats["spend"] / stats["leads"], 2) if stats["leads"] > 0 else 0
+        result.append({
+            "id": cid,
+            "name": stats["name"],
+            "spend": round(stats["spend"], 2),
+            "leads": stats["leads"],
+            "cpl": cpl
+        })
+    return result
+
+# === Получение аккаунтов ===
+def get_ad_accounts():
+    url = "https://graph.facebook.com/v19.0/me/adaccounts"
+    params = {"fields": "name,account_id", "access_token": META_TOKEN}
+    r = requests.get(url, params=params).json()
+    return r.get("data", [])
 
 # === Хендлеры ===
-
 @router.message(Command("start"))
 async def start_handler(msg: Message):
     kb = InlineKeyboardBuilder()
@@ -90,21 +84,13 @@ async def show_active_all(callback: CallbackQuery):
 
     result_text = []
     for acc in accounts:
-        campaigns = get_campaigns(acc["account_id"])
-        active_campaigns = []
-
-        for c in campaigns:
-            active_adsets = get_active_adsets(c["id"])
-            if active_adsets:
-                active_campaigns.append(c)
-
-        if active_campaigns:
+        campaigns = get_active_campaigns(acc["account_id"])
+        if campaigns:
             result_text.append(f"--- {acc['name']} ({acc['account_id']}) ---")
-            for c in active_campaigns:
-                insights = get_campaign_insights(c["id"])
+            for c in campaigns:
                 result_text.append(
                     f"• {c['name']}\n"
-                    f"   Расход: ${insights['spend']} | Лидов: {insights['leads']} | CPL: ${insights['cpl']}\n"
+                    f"   Расход: ${c['spend']} | Лидов: {c['leads']} | CPL: ${c['cpl']}\n"
                 )
         else:
             result_text.append(f"--- {acc['name']} --- Нет активных кампаний")
@@ -112,8 +98,8 @@ async def show_active_all(callback: CallbackQuery):
     await callback.message.answer("\n".join(result_text))
     await callback.answer()
 
+# === Запуск ===
 dp.include_router(router)
-
 async def main():
     await dp.start_polling(bot)
 
