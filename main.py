@@ -1,19 +1,24 @@
 import os
 import requests
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, executor, types
+import asyncio
 from datetime import date
+from aiogram import Bot, Dispatcher, Router
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from dotenv import load_dotenv
 
-# === Загрузка переменных окружения (.env) ===
+# --- Загрузка переменных окружения ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 META_TOKEN = os.getenv("META_ACCESS_TOKEN")
 
-# === Инициализация Telegram бота ===
+# --- Инициализация бота ---
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
+router = Router()
 
-# === Получение рекламных аккаунтов из Meta Ads ===
+# --- Получение рекламных аккаунтов ---
 def get_ad_accounts():
     url = "https://graph.facebook.com/v19.0/me/adaccounts"
     params = {
@@ -23,7 +28,7 @@ def get_ad_accounts():
     r = requests.get(url, params=params).json()
     return r.get("data", [])
 
-# === Получение всех кампаний для конкретного аккаунта ===
+# --- Получение кампаний ---
 def get_campaigns(ad_account_id):
     url = f"https://graph.facebook.com/v19.0/{ad_account_id}/campaigns"
     params = {
@@ -33,7 +38,7 @@ def get_campaigns(ad_account_id):
     r = requests.get(url, params=params).json()
     return r.get("data", [])
 
-# === Получение метрик кампании (Spend, Leads, CPL) ===
+# --- Получение метрик кампании ---
 def get_campaign_insights(campaign_id):
     today = date.today().strftime("%Y-%m-%d")
     url = f"https://graph.facebook.com/v19.0/{campaign_id}/insights"
@@ -55,20 +60,20 @@ def get_campaign_insights(campaign_id):
     cpl = round(spend / leads, 2) if leads > 0 else 0
     return {"spend": spend, "leads": leads, "cpl": cpl}
 
-# === /start ===
-@dp.message_handler(commands=['start'])
-async def start(message: types.Message):
-    keyboard = types.InlineKeyboardMarkup()
-    btn_all_active = types.InlineKeyboardButton("Показать активные кампании", callback_data="show_active_all")
-    keyboard.add(btn_all_active)
-    await message.reply("Привет! Нажми кнопку, чтобы увидеть активные кампании:", reply_markup=keyboard)
+# --- Команда /start ---
+@router.message(Command("start"))
+async def start_handler(msg: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Показать активные кампании", callback_data="show_active_all")
+    await msg.answer("Привет! Что хочешь сделать?", reply_markup=kb.as_markup())
 
-# === Показать активные кампании для всех аккаунтов ===
-@dp.callback_query_handler(lambda c: c.data == "show_active_all")
-async def show_active_all(callback_query: types.CallbackQuery):
+# --- Callback: показать активные кампании ---
+@router.callback_query(lambda c: c.data == "show_active_all")
+async def show_active_all(callback: CallbackQuery):
     accounts = get_ad_accounts()
     if not accounts:
-        await callback_query.message.reply("Аккаунты не найдены.")
+        await callback.message.answer("Аккаунты не найдены.")
+        await callback.answer()
         return
 
     result_text = []
@@ -87,9 +92,15 @@ async def show_active_all(callback_query: types.CallbackQuery):
         else:
             result_text.append(f"--- {acc['name']} --- Нет активных кампаний")
 
-    await callback_query.message.reply("\n".join(result_text))
-    await callback_query.answer()
+    await callback.message.answer("\n".join(result_text))
+    await callback.answer()
 
-# === Запуск бота ===
+# --- Регистрация роутеров ---
+dp.include_router(router)
+
+# --- Запуск ---
+async def main():
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
