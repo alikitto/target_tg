@@ -1,6 +1,6 @@
 import os
-import requests
 import asyncio
+import requests
 from datetime import date
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, CallbackQuery
@@ -13,13 +13,14 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 META_TOKEN = os.getenv("META_ACCESS_TOKEN")
 
-# --- Инициализация бота ---
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# --- Получение рекламных аккаунтов ---
+# === API ===
+
 def get_ad_accounts():
+    """Получение всех рекламных аккаунтов"""
     url = "https://graph.facebook.com/v19.0/me/adaccounts"
     params = {
         "fields": "name,account_id,account_status",
@@ -28,8 +29,8 @@ def get_ad_accounts():
     r = requests.get(url, params=params).json()
     return r.get("data", [])
 
-# --- Получение кампаний ---
 def get_campaigns(ad_account_id):
+    """Получение всех кампаний рекламного аккаунта"""
     url = f"https://graph.facebook.com/v19.0/{ad_account_id}/campaigns"
     params = {
         "fields": "id,name,status,daily_budget",
@@ -38,8 +39,19 @@ def get_campaigns(ad_account_id):
     r = requests.get(url, params=params).json()
     return r.get("data", [])
 
-# --- Получение метрик кампании ---
+def get_active_adsets(campaign_id):
+    """Получение активных adset кампании"""
+    url = f"https://graph.facebook.com/v19.0/{campaign_id}/adsets"
+    params = {
+        "fields": "id,name,effective_status",
+        "access_token": META_TOKEN
+    }
+    r = requests.get(url, params=params).json()
+    adsets = r.get("data", [])
+    return [a for a in adsets if a.get("effective_status") == "ACTIVE"]
+
 def get_campaign_insights(campaign_id):
+    """Метрики кампании (расход, лиды, CPL)"""
     today = date.today().strftime("%Y-%m-%d")
     url = f"https://graph.facebook.com/v19.0/{campaign_id}/insights"
     params = {
@@ -60,14 +72,14 @@ def get_campaign_insights(campaign_id):
     cpl = round(spend / leads, 2) if leads > 0 else 0
     return {"spend": spend, "leads": leads, "cpl": cpl}
 
-# --- Команда /start ---
+# === Хендлеры ===
+
 @router.message(Command("start"))
 async def start_handler(msg: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="Показать активные кампании", callback_data="show_active_all")
     await msg.answer("Привет! Что хочешь сделать?", reply_markup=kb.as_markup())
 
-# --- Callback: показать активные кампании ---
 @router.callback_query(lambda c: c.data == "show_active_all")
 async def show_active_all(callback: CallbackQuery):
     accounts = get_ad_accounts()
@@ -79,11 +91,16 @@ async def show_active_all(callback: CallbackQuery):
     result_text = []
     for acc in accounts:
         campaigns = get_campaigns(acc["account_id"])
-        active = [c for c in campaigns if c["status"] == "ACTIVE"]
+        active_campaigns = []
 
-        if active:
+        for c in campaigns:
+            active_adsets = get_active_adsets(c["id"])
+            if active_adsets:
+                active_campaigns.append(c)
+
+        if active_campaigns:
             result_text.append(f"--- {acc['name']} ({acc['account_id']}) ---")
-            for c in active:
+            for c in active_campaigns:
                 insights = get_campaign_insights(c["id"])
                 result_text.append(
                     f"• {c['name']}\n"
@@ -95,10 +112,8 @@ async def show_active_all(callback: CallbackQuery):
     await callback.message.answer("\n".join(result_text))
     await callback.answer()
 
-# --- Регистрация роутеров ---
 dp.include_router(router)
 
-# --- Запуск ---
 async def main():
     await dp.start_polling(bot)
 
