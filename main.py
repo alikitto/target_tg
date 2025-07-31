@@ -53,7 +53,8 @@ async def get_all_adsets(session: aiohttp.ClientSession, account_id: str):
     return data.get("data", [])
 
 async def get_adset_insights(session: aiohttp.ClientSession, account_id: str, adset_ids: list):
-    start_date = "2020-01-01"
+    # ### ИЗМЕНЕНИЕ: Дата начала изменена на 1 июня.
+    start_date = "2025-06-01"
     end_date = datetime.now().strftime("%Y-%m-%d")
     adset_ids_json_string = json.dumps(adset_ids)
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
@@ -163,7 +164,6 @@ async def build_report(event: Message | CallbackQuery):
     status_msg = await send_and_store(message, "⏳ Начинаю сбор данных...")
     active_accounts_data = []
     
-    # ### ИЗМЕНЕНИЕ: Устанавливаем таймаут для всех запросов в сессии
     timeout = aiohttp.ClientTimeout(total=120) # 2 минуты на каждый запрос
     
     try:
@@ -178,7 +178,6 @@ async def build_report(event: Message | CallbackQuery):
                 base_text = f"📦({idx}/{total}) Кабинет: <b>{acc['name']}</b>\n"
                 
                 try:
-                    # ### ИЗМЕНЕНИЕ: Детальные статусы для каждого шага
                     await status_msg.edit_text(base_text + " Cкачиваю кампании...")
                     campaigns = await get_campaigns(session, acc["account_id"])
                     active_campaigns = {c["id"]: c for c in campaigns if c.get("status") == "ACTIVE"}
@@ -195,7 +194,6 @@ async def build_report(event: Message | CallbackQuery):
                     await status_msg.edit_text(base_text + " Cкачиваю статистику...")
                     insights = await get_adset_insights(session, acc["account_id"], adset_ids)
 
-                    # ... (остальная логика обработки данных)
                     spend_map, chats_map = {}, {}
                     for row in insights:
                         spend = float(row.get("spend", 0))
@@ -224,7 +222,7 @@ async def build_report(event: Message | CallbackQuery):
 
                 except asyncio.TimeoutError:
                     await send_and_store(message, f"⚠️ <b>Превышен таймаут</b> при обработке кабинета <b>{acc['name']}</b>. Пропускаю его.")
-                    continue # Переходим к следующему аккаунту
+                    continue 
     
     except aiohttp.ClientResponseError as e:
         error_details = "Не удалось получить детали ошибки"
@@ -242,7 +240,6 @@ async def build_report(event: Message | CallbackQuery):
     except Exception as e:
         await status_msg.edit_text(f"❌ <b>Произошла неизвестная ошибка:</b>\n{type(e).__name__}: {e}")
         return
-
     if not active_accounts_data:
         await status_msg.edit_text("✅ Активных кампаний с затратами или лидами не найдено.")
         return
