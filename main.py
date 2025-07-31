@@ -66,8 +66,25 @@ async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id:
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
+# ### ИЗМЕНЕНИЕ: Гибридный подход. Две функции для получения статистики.
+
+async def get_ad_level_insights_sync(session: aiohttp.ClientSession, account_id: str, ad_ids: list, start_date: str):
+    """Получает статистику СИНХРОННО (быстро) для коротких периодов."""
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    ad_ids_json_string = json.dumps(ad_ids)
+    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
+    params = {
+        "fields": "ad_id,spend,actions,ctr,link_clicks",
+        "level": "ad",
+        "filtering": f'[{{"field":"ad.id","operator":"IN","value":{ad_ids_json_string}}}]',
+        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
+        "limit": 1000
+    }
+    data = await fb_get(session, url, params)
+    return data.get("data", [])
+
 async def start_async_insights_job(session: aiohttp.ClientSession, account_id: str, ad_ids: list, start_date: str):
-    """Отправляет запрос на создание отчета в фоновом режиме."""
+    """Запускает АСИНХРОННЫЙ отчет (надежно) для длинных периодов."""
     end_date = datetime.now().strftime("%Y-%m-%d")
     ad_ids_json_string = json.dumps(ad_ids)
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
@@ -81,13 +98,11 @@ async def start_async_insights_job(session: aiohttp.ClientSession, account_id: s
     return response.get('report_run_id')
 
 async def check_async_job_status(session: aiohttp.ClientSession, report_run_id: str):
-    """Проверяет статус готовности отчета."""
     url = f"https://graph.facebook.com/{API_VERSION}/{report_run_id}"
     params = {"fields": "async_status,async_percent_completion"}
     return await fb_get(session, url, params=params)
 
 async def get_async_job_results(session: aiohttp.ClientSession, report_run_id: str):
-    """Получает результаты завершенного асинхронного отчета."""
     url = f"https://graph.facebook.com/{API_VERSION}/{report_run_id}/insights"
     params = {"limit": 1000}
     all_results = []
@@ -139,11 +154,7 @@ async def update_panel(chat_id: int, text: str, **kwargs):
 # ===         Меню         ===
 # ============================
 async def set_bot_commands(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="🚀 Показать пульт управления"),
-        BotCommand(command="report", description="📊 Запросить отчёт"),
-        BotCommand(command="clear", description="🧹 Очистить временные сообщения"),
-    ]
+    commands = [BotCommand(command="start", description="🚀 Показать пульт управления"), BotCommand(command="report", description="📊 Запросить отчёт"), BotCommand(command="clear", description="🧹 Очистить временные сообщения")]
     await bot.set_my_commands(commands, BotCommandScopeDefault())
 
 def inline_main_menu():
@@ -152,7 +163,6 @@ def inline_main_menu():
     kb.button(text="🧹 Очистить временные сообщения", callback_data="clear_chat")
     return kb.as_markup()
 
-# ### ИЗМЕНЕНИЕ: Новое меню для выбора периода отчета
 def inline_period_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="За сегодня", callback_data="report_period:today")
@@ -160,7 +170,7 @@ def inline_period_menu():
     kb.button(text="За 30 дней", callback_data="report_period:month")
     kb.button(text="С 1 июня 2025", callback_data="report_period:all_time")
     kb.button(text="⬅️ Назад", callback_data="show_menu")
-    kb.adjust(2, 2, 1) # Красиво располагаем кнопки
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 # ============================
@@ -204,28 +214,29 @@ async def clear_chat_handler(event: Message | CallbackQuery):
         except TelegramBadRequest:
             pass
 
-# ### ИЗМЕНЕНИЕ: Хендлер для показа меню выбора периода
 @router.callback_query(F.data == "select_report_period")
 async def select_period_handler(call: CallbackQuery):
     await update_panel(call.message.chat.id, "🗓️ Выберите период для отчета:", reply_markup=inline_period_menu())
     await call.answer()
 
-# ### ИЗМЕНЕНИЕ: Основной хендлер теперь запускается после выбора периода
 @router.callback_query(F.data.startswith("report_period:"))
 async def build_report(call: CallbackQuery):
     chat_id = call.message.chat.id
     period = call.data.split(":")[1]
 
-    # Определяем дату начала в зависимости от выбора
     today = datetime.now()
     if period == 'today':
         start_date = today.strftime("%Y-%m-%d")
+        use_async = False
     elif period == 'week':
         start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        use_async = False
     elif period == 'month':
         start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+        use_async = True
     else: # all_time
         start_date = "2025-06-01"
+        use_async = True
 
     await update_panel(chat_id, "⏳ Начинаю сбор данных...")
     all_accounts_data = {}
@@ -259,40 +270,37 @@ async def build_report(call: CallbackQuery):
                     if not ads: continue
                     
                     ad_ids = [ad['id'] for ad in ads]
-                    await update_panel(chat_id, base_text + f" Запускаю асинхронный отчет для {len(ad_ids)} объявлений...")
-                    report_run_id = await start_async_insights_job(session, acc["account_id"], ad_ids, start_date)
-
-                    if not report_run_id:
-                        msg = await bot.send_message(chat_id, f"⚠️ Не удалось запустить отчет для кабинета <b>{acc['name']}</b>.")
-                        await store_message_id(chat_id, msg.message_id)
-                        continue
-
                     insights = []
-                    while True:
-                        status_data = await check_async_job_status(session, report_run_id)
-                        status = status_data.get('async_status')
-                        percent = status_data.get('async_percent_completion', 0)
-                        await update_panel(chat_id, base_text + f" Отчет готовится: {percent}%...")
-                        if status == 'Job Completed':
-                            insights = await get_async_job_results(session, report_run_id)
-                            break
-                        elif status == 'Job Failed':
-                            msg = await bot.send_message(chat_id, f"❌ Отчет для кабинета <b>{acc['name']}</b> не удался.")
+
+                    # ### ИЗМЕНЕНИЕ: Выбираем метод получения статистики
+                    if use_async:
+                        await update_panel(chat_id, base_text + f" Запускаю асинхронный отчет для {len(ad_ids)} объявлений...")
+                        report_run_id = await start_async_insights_job(session, acc["account_id"], ad_ids, start_date)
+                        if not report_run_id:
+                            msg = await bot.send_message(chat_id, f"⚠️ Не удалось запустить отчет для кабинета <b>{acc['name']}</b>.")
                             await store_message_id(chat_id, msg.message_id)
-                            break
-                        await asyncio.sleep(15)
-                    
+                            continue
+                        
+                        while True:
+                            status_data = await check_async_job_status(session, report_run_id)
+                            status = status_data.get('async_status')
+                            percent = status_data.get('async_percent_completion', 0)
+                            await update_panel(chat_id, base_text + f" Отчет готовится: {percent}%...")
+                            if status == 'Job Completed':
+                                insights = await get_async_job_results(session, report_run_id)
+                                break
+                            elif status == 'Job Failed':
+                                msg = await bot.send_message(chat_id, f"❌ Отчет для кабинета <b>{acc['name']}</b> не удался.")
+                                await store_message_id(chat_id, msg.message_id)
+                                break
+                            await asyncio.sleep(10)
+                    else:
+                        await update_panel(chat_id, base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
+                        insights = await get_ad_level_insights_sync(session, acc["account_id"], ad_ids, start_date)
+
                     if not insights: continue
 
-                    insights_map = {}
-                    for row in insights:
-                        ad_id = row['ad_id']
-                        insights_map[ad_id] = {
-                            "spend": float(row.get("spend", 0)),
-                            "leads": sum(int(a["value"]) for a in row.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE),
-                            "clicks": int(row.get("link_clicks", 0)),
-                            "ctr": float(row.get("ctr", 0))
-                        }
+                    insights_map = {row['ad_id']: {"spend": float(row.get("spend", 0)), "leads": sum(int(a["value"]) for a in row.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE), "clicks": int(row.get("link_clicks", 0)), "ctr": float(row.get("ctr", 0))} for row in insights}
 
                     account_data = {}
                     for ad in ads:
@@ -353,13 +361,7 @@ async def build_report(call: CallbackQuery):
                     total_cost_per_action = (total_spend / total_metric_val) if total_metric_val > 0 else 0
                     metric_name, cost_name = "Лиды", "CPL"
 
-                msg_lines.extend([
-                    f"  <b>↳ Группа:</b> <code>{adset_data['name']}</code>",
-                    f"    - <b>Цель:</b> {objective_clean}",
-                    f"    - <b>{metric_name}:</b> {total_metric_val}",
-                    f"    - <b>Расход:</b> ${total_spend:.2f}",
-                    f"    - <b>{cost_name}:</b> ${total_cost_per_action:.2f} {metric_label(total_cost_per_action)}"
-                ])
+                msg_lines.extend([f"  <b>↳ Группа:</b> <code>{adset_data['name']}</code>", f"    - <b>Цель:</b> {objective_clean}", f"    - <b>{metric_name}:</b> {total_metric_val}", f"    - <b>Расход:</b> ${total_spend:.2f}", f"    - <b>{cost_name}:</b> ${total_cost_per_action:.2f} {metric_label(total_cost_per_action)}"])
                 
                 if adset_data['ads']:
                     msg_lines.append("  <b>↳ Объявления:</b>")
