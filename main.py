@@ -18,6 +18,7 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 
+# --- Graph API helper ---
 def fb_get(url, params=None):
     if not params:
         params = {}
@@ -26,8 +27,8 @@ def fb_get(url, params=None):
     r.raise_for_status()
     return r.json()
 
+# --- Data collectors ---
 def get_active_adsets(ad_account_id, start_date, end_date):
-    # Insights по активным adset
     active_filter = '[{"field":"adset.effective_status","operator":"IN","value":["ACTIVE"]}]'
     url = f"https://graph.facebook.com/v19.0/{ad_account_id}/insights"
     params = {
@@ -38,8 +39,6 @@ def get_active_adsets(ad_account_id, start_date, end_date):
         "limit": 500
     }
     data = fb_get(url, params).get("data", [])
-    if not data:
-        return {}
     result = {}
     for item in data:
         chats = 0
@@ -139,6 +138,12 @@ def get_ad_accounts():
     data = fb_get(url, {"fields": "name,account_id"})
     return data.get("data", [])
 
+# --- Progress bar helper ---
+def progress_bar(current, total, length=20):
+    filled = int(length * current // total)
+    return "▓" * filled + "░" * (length - filled)
+
+# --- Handlers ---
 @router.message(Command("start"))
 async def start_handler(msg: Message):
     kb = InlineKeyboardBuilder()
@@ -147,41 +152,52 @@ async def start_handler(msg: Message):
 
 @router.callback_query(lambda c: c.data == "build_report")
 async def build_report(callback: CallbackQuery):
-    start_date = (date.today()).strftime("%Y-%m-%d")
-    end_date = (date.today()).strftime("%Y-%m-%d")
+    start_date = date.today().strftime("%Y-%m-%d")
+    end_date = date.today().strftime("%Y-%m-%d")
     accounts = get_ad_accounts()
     if not accounts:
         await callback.message.answer("Нет рекламных аккаунтов.")
         return
 
-    for acc in accounts:
-        aggregatedData = get_active_adsets(acc["account_id"], start_date, end_date)
-        if not aggregatedData:
-            await callback.message.answer(f"--- {acc['name']} --- Нет активных кампаний.")
-            continue
-
-        adset_ids = list(aggregatedData.keys())
-        fill_placements(acc["account_id"], adset_ids, start_date, end_date, aggregatedData)
-        fill_ages(acc["account_id"], adset_ids, start_date, end_date, aggregatedData)
-
-        campaign_ids = [aggregatedData[x]["campaign_id"] for x in adset_ids]
-        campaign_objectives = get_campaign_objectives(set(campaign_ids))
-        adset_statuses = get_adset_statuses(adset_ids)
-
-        report_lines = [f"--- {acc['name']} ---"]
-        for adsetId, stats in aggregatedData.items():
-            cpl = stats["totalSpend"] / stats["totalChats"] if stats["totalChats"] > 0 else 0
-            report_lines.append(
-                f"{stats['campaign_name']} | {stats['adset_name']} | "
-                f"Статус: {adset_statuses.get(adsetId,'')} | "
-                f"Цель: {campaign_objectives.get(stats['campaign_id'],'')} | "
-                f"Лидов: {stats['totalChats']} | CPL: ${cpl:.2f} | "
-                f"Расход: ${stats['totalSpend']:.2f}"
-            )
-        await callback.message.answer("\n".join(report_lines))
-        time.sleep(1)
-
+    status_msg = await callback.message.answer("Начинаю сбор данных…")
     await callback.answer()
+
+    report_lines_all = []
+
+    for i, acc in enumerate(accounts, start=1):
+        bar = progress_bar(i, len(accounts))
+        await status_msg.edit_text(f"Собираю данные {i}/{len(accounts)} {bar}\nАккаунт: {acc['name']}")
+
+        # шаги для одного аккаунта
+        await status_msg.edit_text(f"{bar}\n{acc['name']}\nШаг 1/4: Получение активных adset…")
+        aggregatedData = get_active_adsets(acc["account_id"], start_date, end_date)
+        await status_msg.edit_text(f"{bar}\n{acc['name']}\nШаг 2/4: Плейсменты…")
+        if aggregatedData:
+            adset_ids = list(aggregatedData.keys())
+            fill_placements(acc["account_id"], adset_ids, start_date, end_date, aggregatedData)
+            await status_msg.edit_text(f"{bar}\n{acc['name']}\nШаг 3/4: Возраст…")
+            fill_ages(acc["account_id"], adset_ids, start_date, end_date, aggregatedData)
+            await status_msg.edit_text(f"{bar}\n{acc['name']}\nШаг 4/4: Цели и статусы…")
+            campaign_ids = [aggregatedData[x]["campaign_id"] for x in adset_ids]
+            campaign_objectives = get_campaign_objectives(set(campaign_ids))
+            adset_statuses = get_adset_statuses(adset_ids)
+
+            report_lines_all.append(f"--- {acc['name']} ---")
+            for adsetId, stats in aggregatedData.items():
+                cpl = stats["totalSpend"] / stats["totalChats"] if stats["totalChats"] > 0 else 0
+                report_lines_all.append(
+                    f"{stats['campaign_name']} | {stats['adset_name']} | "
+                    f"Статус: {adset_statuses.get(adsetId,'')} | "
+                    f"Цель: {campaign_objectives.get(stats['campaign_id'],'')} | "
+                    f"Лидов: {stats['totalChats']} | CPL: ${cpl:.2f} | "
+                    f"Расход: ${stats['totalSpend']:.2f}"
+                )
+        else:
+            report_lines_all.append(f"--- {acc['name']} --- Нет активных кампаний.")
+
+    await status_msg.edit_text("Отчёт готов. Отправляю данные…")
+    await callback.message.answer("\n".join(report_lines_all))
+    await status_msg.edit_text("Готово ✅")
 
 dp.include_router(router)
 
