@@ -22,7 +22,6 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 router = Router()
 
-# Используем словарь для хранения сообщений по ID чата, чтобы избежать хаоса
 sent_messages_by_chat = {}
 
 # ============================
@@ -47,15 +46,23 @@ async def get_campaigns(session: aiohttp.ClientSession, account_id: str):
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-async def get_all_adsets(session: aiohttp.ClientSession, account_id: str):
-    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/adsets"
-    params = {"fields": "id,name,campaign_id,status", "limit": 500}
+# ### ИЗМЕНЕНИЕ: Умная функция, которая находит только РЕАЛЬНО РАБОТАЮЩИЕ группы
+async def get_delivering_adsets(session: aiohttp.ClientSession, account_id: str, start_date: str, end_date: str):
+    """Находит ID и данные только тех групп, у которых были траты в заданный период."""
+    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
+    params = {
+        "fields": "adset_id,adset_name,campaign_id",
+        "level": "adset",
+        "filtering": f'[{{"field":"spend","operator":"GREATER_THAN","value":0}}]',
+        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
+        "limit": 500
+    }
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id: str, active_adset_ids: list):
+async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id: str, delivering_adset_ids: list):
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/ads"
-    filtering = [{'field': 'adset.id', 'operator': 'IN', 'value': active_adset_ids}, {'field': 'effective_status', 'operator': 'IN', 'value': ['ACTIVE']}]
+    filtering = [{'field': 'adset.id', 'operator': 'IN', 'value': delivering_adset_ids}, {'field': 'effective_status', 'operator': 'IN', 'value': ['ACTIVE']}]
     params = {"fields": "id,name,adset_id,campaign_id,creative{thumbnail_url}", "filtering": json.dumps(filtering), "limit": 1000}
     data = await fb_get(session, url, params)
     return data.get("data", [])
@@ -185,18 +192,20 @@ async def build_report(call: CallbackQuery):
                 base_text = f"📦({idx}/{total}) Кабинет: <b>{acc['name']}</b>\n"
                 
                 try:
-                    await status_msg.edit_text(base_text + " Cкачиваю кампании и группы...")
+                    await status_msg.edit_text(base_text + " Поиск работающих кампаний...")
                     campaigns = await get_campaigns(session, acc["account_id"])
                     campaigns_map = {c['id']: c for c in campaigns}
                     
-                    adsets = await get_all_adsets(session, acc["account_id"])
-                    active_adsets = [a for a in adsets if a.get("status") == "ACTIVE"]
-                    if not active_adsets: continue
-                    adsets_map = {a['id']: a for a in active_adsets}
-                    active_adset_ids = list(adsets_map.keys())
+                    # ### ИЗМЕНЕНИЕ: Сразу получаем только РАБОТАЮЩИЕ группы
+                    delivering_adsets = await get_delivering_adsets(session, acc["account_id"], start_date, end_date)
+                    if not delivering_adsets:
+                        continue # Если нет групп с тратами, сразу переходим к след. кабинету
+                    
+                    adsets_map = {a['adset_id']: a for a in delivering_adsets}
+                    delivering_adset_ids = list(adsets_map.keys())
 
                     await status_msg.edit_text(base_text + " Cкачиваю объявления...")
-                    ads = await get_all_ads_with_creatives(session, acc["account_id"], active_adset_ids)
+                    ads = await get_all_ads_with_creatives(session, acc["account_id"], delivering_adset_ids)
                     if not ads: continue
                     
                     ad_ids = [ad['id'] for ad in ads]
@@ -224,7 +233,7 @@ async def build_report(call: CallbackQuery):
                             account_data[campaign_id] = {"name": campaign_obj['name'], "objective_raw": campaign_obj.get("objective", "N/A"), "adsets": {}}
                         
                         if adset_id not in account_data[campaign_id]['adsets']:
-                            account_data[campaign_id]['adsets'][adset_id] = {"name": adsets_map[adset_id]['name'], "ads": []}
+                            account_data[campaign_id]['adsets'][adset_id] = {"name": adsets_map[adset_id]['adset_name'], "ads": []}
                         
                         ad_info = {"name": ad['name'], "thumbnail_url": ad.get('creative', {}).get('thumbnail_url'), **stats}
                         account_data[campaign_id]['adsets'][adset_id]['ads'].append(ad_info)
