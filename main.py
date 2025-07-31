@@ -2,7 +2,7 @@ import os
 import asyncio
 import aiohttp
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (Message, CallbackQuery, BotCommand, BotCommandScopeDefault,
                            ReplyKeyboardMarkup, KeyboardButton)
@@ -10,6 +10,9 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
+
+# Импортируем нашу новую функцию
+from daily_report import generate_daily_report_text
 
 # --- Конфигурация и константы ---
 load_dotenv()
@@ -24,7 +27,6 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 router = Router()
 
-# Словарь для хранения ID сообщений для последующей очистки
 sent_messages_by_chat = {}
 
 # ============================
@@ -32,7 +34,6 @@ sent_messages_by_chat = {}
 # ============================
 
 async def fb_get(session: aiohttp.ClientSession, url: str, params: dict = None):
-    """Асинхронная функция для выполнения GET-запросов к Graph API."""
     params = params or {}
     params["access_token"] = META_TOKEN
     async with session.get(url, params=params) as response:
@@ -40,12 +41,12 @@ async def fb_get(session: aiohttp.ClientSession, url: str, params: dict = None):
         return await response.json()
 
 async def get_ad_accounts(session: aiohttp.ClientSession):
-    """Получает список рекламных аккаунтов."""
     url = f"https://graph.facebook.com/{API_VERSION}/me/adaccounts"
     params = {"fields": "name,account_id"}
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
+# ... (остальные ваши функции API: get_campaigns, get_all_adsets и т.д. остаются здесь без изменений) ...
 async def get_campaigns(session: aiohttp.ClientSession, account_id: str):
     """Получает список кампаний для аккаунта."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/campaigns"
@@ -92,11 +93,10 @@ async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str,
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-
 # ============================
 # ===      Помощники       ===
 # ============================
-
+# ... (cpl_label, send_and_store - всё остаётся без изменений) ...
 def cpl_label(value: float, metric: str) -> str:
     """Возвращает текстовую метку для CPL или CPC."""
     if metric == "cpc":
@@ -122,7 +122,7 @@ async def send_and_store(message: Message | CallbackQuery, text: str, *, is_pers
 # ============================
 # ===         Меню         ===
 # ============================
-
+# ... (set_bot_commands, main_reply_menu, inline_period_menu - всё остаётся без изменений) ...
 async def set_bot_commands(bot: Bot):
     """Устанавливает команды в меню Telegram (кнопка слева от поля ввода)."""
     commands = [
@@ -166,10 +166,9 @@ def inline_period_menu():
 # ============================
 # ===       Хендлеры       ===
 # ============================
-
 @router.message(Command("start", "restart"))
 async def start_handler(msg: Message):
-    """Обработчик команды /start. Отправляет приветствие и показывает ГЛАВНОЕ меню."""
+    # ... (код без изменений) ...
     await msg.answer(
         "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:",
         reply_markup=main_reply_menu()
@@ -177,12 +176,37 @@ async def start_handler(msg: Message):
 
 @router.message(F.text == "📊 Активные кампании")
 async def report_period_select_handler(message: Message):
-    """Реагирует на кнопку "Активные кампании" и предлагает выбрать период."""
+    # ... (код без изменений) ...
     await message.answer("🗓️ Выберите период для отчёта:", reply_markup=inline_period_menu())
+    
+# --- НОВЫЙ ХЕНДЛЕР для дневного отчета ---
+@router.message(F.text == "📈 Дневной отчёт")
+async def daily_report_handler(message: Message):
+    status_msg = await message.answer("⏳ Собираю дневную сводку, это может занять до минуты...")
+    
+    try:
+        # Получаем список аккаунтов
+        async with aiohttp.ClientSession() as session:
+            accounts = await get_ad_accounts(session)
+        
+        if not accounts:
+            await status_msg.edit_text("❌ Не найдено ни одного рекламного аккаунта.")
+            return
+            
+        # Вызываем нашу новую функцию из другого файла
+        report_text = await generate_daily_report_text(accounts, META_TOKEN)
+        
+        # Удаляем сообщение о статусе и отправляем готовый отчет
+        await bot.delete_message(message.chat.id, status_msg.message_id)
+        await message.answer(report_text)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Произошла ошибка при создании дневного отчёта:\n\n{type(e).__name__}: {e}")
+
 
 @router.message(F.text == "🆘 Помощь")
 async def help_handler(message: Message):
-    """Реагирует на кнопку "Помощь" и выводит справку."""
+    # ... (код без изменений) ...
     help_text = (
         "<b>ℹ️ Справка по боту:</b>\n\n"
         "● <b>📊 Активные кампании</b> - формирует детальный отчёт по всем активным кампаниям за выбранный период.\n\n"
@@ -191,7 +215,8 @@ async def help_handler(message: Message):
     )
     await message.answer(help_text)
 
-@router.message(F.text.in_({"📈 Дневной отчёт", "💡 Рекомендации (AI)"}))
+# ... (остальные хендлеры: future_functions_handler, clear_chat_logic, build_report_handler - остаются без изменений) ...
+@router.message(F.text.in_({"💡 Рекомендации (AI)"}))
 async def future_functions_handler(message: Message):
     """Реагирует на кнопки функций, которые находятся в разработке."""
     await message.answer(f"Вы выбрали: {message.text}\n\nЭтот функционал будет добавлен в следующих версиях бота.")
@@ -225,7 +250,6 @@ async def clear_chat_logic(message: Message):
         await asyncio.sleep(3)
         await bot.delete_message(chat_id, status_msg.message_id)
 
-# ============ Отчёт с лоадером ============
 @router.callback_query(F.data.startswith("build_report:"))
 async def build_report_handler(call: CallbackQuery):
     """Основной хендлер для построения отчёта."""
@@ -362,6 +386,7 @@ async def build_report_handler(call: CallbackQuery):
     except TelegramBadRequest: pass
 
     for acc_name, campaigns_data in all_accounts_data.items():
+        # ... (здесь весь блок форматирования отчета остается без изменений) ...
         active_campaign_count = len(campaigns_data)
         msg_lines = [
             f"<b>🏢 Рекламный кабинет:</b> <u>{acc_name}</u>",
@@ -421,13 +446,10 @@ async def build_report_handler(call: CallbackQuery):
 
     await call.message.edit_text("✅ Отчёт завершён.")
 
-
 # ============================
 # ===         Запуск       ===
 # ============================
-
 async def main():
-    """Основная функция для запуска бота."""
     dp.include_router(router)
     await set_bot_commands(bot)
     await bot.delete_webhook(drop_pending_updates=True)
@@ -438,4 +460,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("Бот остановлен вручную.")
-
