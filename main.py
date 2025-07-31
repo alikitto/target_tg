@@ -49,17 +49,6 @@ def get_adset_insights(account_id, adset_ids):
     }
     return fb_get(url, params).get("data", [])
 
-def get_ad_creatives(adset_id):
-    url = f"https://graph.facebook.com/v19.0/{adset_id}/ads"
-    params = {"fields": "creative{thumbnail_url}", "limit": 5}
-    data = fb_get(url, params).get("data", [])
-    thumbs = []
-    for ad in data:
-        thumb = ad.get("creative", {}).get("thumbnail_url")
-        if thumb:
-            thumbs.append(thumb)
-    return thumbs[:3]  # ограничиваем до 3
-
 # ================= Progress bar =================
 def progress_bar(current, total, length=20):
     filled = int(length * current // total)
@@ -99,15 +88,12 @@ async def build_report(callback: CallbackQuery):
         adset_ids = [a["id"] for a in active_adsets]
         insights = get_adset_insights(acc["account_id"], adset_ids)
 
-        spend_map = {}
-        chats_map = {}
+        spend_map, chats_map = {}, {}
         for row in insights:
             adset_id = row["adset_id"]
             spend = float(row.get("spend", 0))
-            chats = 0
-            for action in row.get("actions", []):
-                if action["action_type"] == "onsite_conversion.messaging_conversation_started_7d":
-                    chats += int(action["value"])
+            chats = sum(int(a["value"]) for a in row.get("actions", [])
+                        if a["action_type"] == "onsite_conversion.messaging_conversation_started_7d")
             spend_map[adset_id] = spend
             chats_map[adset_id] = chats
 
@@ -125,7 +111,6 @@ async def build_report(callback: CallbackQuery):
                 "cpl": cpl,
                 "leads": chats_map.get(ad["id"], 0),
                 "spend": spend_map.get(ad["id"], 0),
-                "thumbs": get_ad_creatives(ad["id"])
             }
             if camp_id not in campaigns_data:
                 campaigns_data[camp_id] = {"name": campaign["name"], "adsets": []}
@@ -137,7 +122,7 @@ async def build_report(callback: CallbackQuery):
             "active_count": len(campaigns_data)
         })
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
     if not active_accounts_data:
         await status_msg.edit_text("Активных кампаний не найдено.")
@@ -145,7 +130,6 @@ async def build_report(callback: CallbackQuery):
 
     await status_msg.edit_text("Отчёт большой, отправляю частями…")
 
-    # === Отправляем каждый кабинет отдельно ===
     for acc in active_accounts_data:
         msg_lines = []
         msg_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -159,11 +143,19 @@ async def build_report(callback: CallbackQuery):
                     f"   Цель: {ad['objective']} | CPL: ${ad['cpl']:.2f} | "
                     f"Лиды: {ad['leads']} | Расход: ${ad['spend']:.2f}"
                 )
-                if ad["thumbs"]:
-                    msg_lines.append("   Миниатюры:\n   " + "\n   ".join(ad["thumbs"]))
-            msg_lines.append("")  # пустая строка
-        await callback.message.answer("\n".join(msg_lines))
-        await asyncio.sleep(0.3)
+            msg_lines.append("")
+
+        text = "\n".join(msg_lines)
+        try:
+            if len(text) > 3500:
+                chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)]
+                for chunk in chunks:
+                    await callback.message.answer(chunk)
+                    await asyncio.sleep(0.2)
+            else:
+                await callback.message.answer(text)
+        except Exception as e:
+            await callback.message.answer(f"Ошибка при отправке данных аккаунта {acc['name']}: {e}")
 
     await status_msg.edit_text("Готово ✅")
 
