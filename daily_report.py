@@ -17,9 +17,10 @@ async def fb_get(session: aiohttp.ClientSession, url: str, params: dict = None, 
         return await response.json()
 
 async def get_campaign_objectives(session: aiohttp.ClientSession, account_id: str, access_token: str):
-    """Получает словарь {id_кампании: цель_кампании}."""
+    """Получает словарь {id_кампании: цель_кампании} для ВСЕХ кампаний."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/campaigns"
-    params = {"fields": "id,objective", "limit": 1000, "filtering": "[{'field':'effective_status','operator':'IN','value':['ACTIVE']}]"}
+    # УБРАН ФИЛЬТР ПО АКТИВНЫМ СТАТУСАМ - это была ошибка
+    params = {"fields": "id,objective", "limit": 1000}
     data = await fb_get(session, url, params=params, access_token=access_token)
     return {campaign['id']: campaign.get('objective', 'N/A') for campaign in data.get("data", [])}
 
@@ -29,7 +30,7 @@ async def get_ad_level_insights_for_yesterday(session: aiohttp.ClientSession, ac
     params = {
         "fields": "campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,actions,ctr,creative{thumbnail_url}",
         "level": "ad",
-        "date_preset": "yesterday", # Используем надежный пресет
+        "date_preset": "yesterday", # Самый надежный способ получить "вчера"
         "limit": 2000
     }
     data = await fb_get(session, url, params=params, access_token=access_token)
@@ -45,7 +46,7 @@ def structure_insights(insights: list, objectives: dict):
 
         camp_id = ad['campaign_id']
         adset_id = ad['adset_id']
-        
+
         if camp_id not in objectives:
             continue
 
@@ -88,9 +89,12 @@ def analyze_adsets(campaigns_data: dict):
             
             cost = float('inf')
             cost_type = 'CPL'
-            if "TRAFFIC" in camp['objective'].upper() and total_clicks > 0:
-                cost = total_spend / total_clicks
+            
+            # Определяем тип стоимости на основе цели кампании
+            if "TRAFFIC" in camp['objective'].upper():
                 cost_type = 'CPC'
+                if total_clicks > 0:
+                    cost = total_spend / total_clicks
             elif total_leads > 0:
                 cost = total_spend / total_leads
             
@@ -109,12 +113,15 @@ def format_ad_list(ads: list, cost_type: str):
     """Форматирует список объявлений для вывода в отчет."""
     lines = []
     for ad in sorted(ads, key=lambda x: x['spend'], reverse=True):
-        if cost_type == 'CPL':
-            cost = (ad['spend'] / ad['leads']) if ad['leads'] > 0 else 0
+        cost = 0
+        if cost_type == 'CPL' and ad['leads'] > 0:
+            cost = ad['spend'] / ad['leads']
             cost_str = f"CPL: ${cost:.2f}"
-        else:
-            cost = (ad['spend'] / ad['clicks']) if ad['clicks'] > 0 else 0
+        elif cost_type == 'CPC' and ad['clicks'] > 0:
+            cost = ad['spend'] / ad['clicks']
             cost_str = f"CPC: ${cost:.2f}"
+        else:
+            cost_str = f"{cost_type}: $0.00"
             
         lines.append(f'    <a href="{ad["thumbnail_url"]}">▫️</a> <b>{ad["name"]}</b> | {cost_str} | CTR: {ad["ctr"]:.2f}%')
     return lines
