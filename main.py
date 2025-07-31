@@ -69,6 +69,7 @@ async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id:
 # ### ИЗМЕНЕНИЕ: Функции для асинхронных отчетов
 async def start_async_insights_job(session: aiohttp.ClientSession, account_id: str, ad_ids: list):
     """Отправляет запрос на создание отчета в фоновом режиме."""
+    # ### ИЗМЕНЕНИЕ: Установлена дата начала отчета, как вы и просили.
     start_date = "2025-06-01"
     end_date = datetime.now().strftime("%Y-%m-%d")
     ad_ids_json_string = json.dumps(ad_ids)
@@ -151,7 +152,7 @@ async def set_bot_commands(bot: Bot):
 def inline_main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Отчёт: Активные кампании", callback_data="build_report")
-    kb.button(text="🧹 Очистить временные сообщения", callback_data="clear_chat")
+    kb.button(text="� Очистить временные сообщения", callback_data="clear_chat")
     return kb.as_markup()
 
 # ============================
@@ -365,3 +366,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Бот остановлен вручную.")
+�
