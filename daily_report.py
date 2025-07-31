@@ -16,41 +16,27 @@ async def fb_get(session: aiohttp.ClientSession, url: str, params: dict = None, 
         response.raise_for_status()
         return await response.json()
 
-# Упрощенная функция для проверки общей активности
-async def get_account_level_insight(session: aiohttp.ClientSession, account_id: str, date_str: str, access_token: str):
-    """Получает инсайт на уровне аккаунта, чтобы проверить, были ли траты."""
-    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
-    params = {
-        "fields": "spend",
-        "level": "account",
-        "time_range": json.dumps({"since": date_str, "until": date_str}),
-    }
-    data = await fb_get(session, url, params=params, access_token=access_token)
-    if data.get("data"):
-        return float(data["data"][0].get("spend", 0))
-    return 0
-
 async def get_campaign_objectives(session: aiohttp.ClientSession, account_id: str, access_token: str):
     """Получает словарь {id_кампании: цель_кампании}."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/campaigns"
-    params = {"fields": "id,objective", "limit": 1000}
+    params = {"fields": "id,objective", "limit": 1000, "filtering": "[{'field':'effective_status','operator':'IN','value':['ACTIVE']}]"}
     data = await fb_get(session, url, params=params, access_token=access_token)
     return {campaign['id']: campaign.get('objective', 'N/A') for campaign in data.get("data", [])}
 
-async def get_ad_level_insights_for_date(session: aiohttp.ClientSession, account_id: str, date_str: str, access_token: str):
-    """Получает детализированную статистику на уровне объявлений."""
+async def get_ad_level_insights_for_yesterday(session: aiohttp.ClientSession, account_id: str, access_token: str):
+    """Получает детализированную статистику на уровне объявлений за вчерашний день."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
     params = {
         "fields": "campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,actions,ctr,creative{thumbnail_url}",
         "level": "ad",
-        "time_range": json.dumps({"since": date_str, "until": date_str}),
-        "limit": 1000
+        "date_preset": "yesterday", # Используем надежный пресет
+        "limit": 2000
     }
     data = await fb_get(session, url, params=params, access_token=access_token)
     return data.get("data", [])
 
 def structure_insights(insights: list, objectives: dict):
-    # ... (эта функция остается без изменений)
+    """Структурирует плоский список инсайтов в иерархию Кампания -> Группа -> Объявления."""
     campaigns = {}
     for ad in insights:
         spend = float(ad.get("spend", 0))
@@ -66,7 +52,7 @@ def structure_insights(insights: list, objectives: dict):
         if camp_id not in campaigns:
             campaigns[camp_id] = {
                 "name": ad['campaign_name'],
-                "objective": objectives[camp_id],
+                "objective": objectives.get(camp_id, 'N/A'),
                 "adsets": {}
             }
 
@@ -91,9 +77,8 @@ def structure_insights(insights: list, objectives: dict):
         
     return campaigns
 
-
 def analyze_adsets(campaigns_data: dict):
-    # ... (эта функция остается без изменений)
+    """Анализирует группы объявлений, считая их общую статистику и стоимость."""
     analyzed_adsets = []
     for camp_id, camp in campaigns_data.items():
         for adset_id, adset in camp['adsets'].items():
@@ -103,12 +88,12 @@ def analyze_adsets(campaigns_data: dict):
             
             cost = float('inf')
             cost_type = 'CPL'
-            if "TRAFFIC" not in camp['objective'].upper() and total_leads > 0:
-                cost = total_spend / total_leads
-            elif total_clicks > 0:
+            if "TRAFFIC" in camp['objective'].upper() and total_clicks > 0:
                 cost = total_spend / total_clicks
                 cost_type = 'CPC'
-
+            elif total_leads > 0:
+                cost = total_spend / total_leads
+            
             analyzed_adsets.append({
                 "id": adset_id,
                 "name": adset['name'],
@@ -120,11 +105,10 @@ def analyze_adsets(campaigns_data: dict):
             })
     return analyzed_adsets
 
-
 def format_ad_list(ads: list, cost_type: str):
-    # ... (эта функция остается без изменений)
+    """Форматирует список объявлений для вывода в отчет."""
     lines = []
-    for ad in ads:
+    for ad in sorted(ads, key=lambda x: x['spend'], reverse=True):
         if cost_type == 'CPL':
             cost = (ad['spend'] / ad['leads']) if ad['leads'] > 0 else 0
             cost_str = f"CPL: ${cost:.2f}"
@@ -135,17 +119,15 @@ def format_ad_list(ads: list, cost_type: str):
         lines.append(f'    <a href="{ad["thumbnail_url"]}">▫️</a> <b>{ad["name"]}</b> | {cost_str} | CTR: {ad["ctr"]:.2f}%')
     return lines
 
-
 async def generate_daily_report_text(accounts: list, meta_token: str):
     """Основная функция, которая собирает, анализирует и генерирует текст отчета."""
-    yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     report_date_str = (datetime.now() - timedelta(days=1)).strftime('%d %B %Y')
 
     final_report_lines = [f"<b>📈 Дневная сводка за {report_date_str}</b>"]
     
     timeout = aiohttp.ClientTimeout(total=240)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = [process_single_account(session, acc, yesterday_str, meta_token) for acc in accounts]
+        tasks = [process_single_account(session, acc, meta_token) for acc in accounts]
         account_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     active_reports = 0
@@ -160,23 +142,13 @@ async def generate_daily_report_text(accounts: list, meta_token: str):
 
     return "\n".join(final_report_lines)
 
-async def process_single_account(session, acc, date_str, meta_token):
+async def process_single_account(session, acc, meta_token):
     """Обрабатывает один рекламный аккаунт и возвращает готовую текстовую секцию отчета."""
-    # Шаг 1: Проверяем, была ли активность в аккаунте в принципе
-    total_spend_yesterday = await get_account_level_insight(session, acc["account_id"], date_str, meta_token)
-    if total_spend_yesterday == 0:
-        return None # Если трат не было, пропускаем аккаунт
-
-    # Шаг 2: Если траты были, получаем детали
     objectives = await get_campaign_objectives(session, acc["account_id"], meta_token)
-    insights = await get_ad_level_insights_for_date(session, acc["account_id"], date_str, meta_token)
-    
-    # Шаг 3: Структурируем данные
-    if not insights or not objectives:
-        # Если детали не пришли (из-за задержки API), показываем хотя бы общую информацию
-        return (f"─" * 20 + f"\n<b>🏢 Кабинет: <u>{acc['name']}</u></b>\n"
-                f"`Расход: ${total_spend_yesterday:.2f}`\n"
-                f"`(Детализированная статистика по группам еще не доступна)`")
+    insights = await get_ad_level_insights_for_yesterday(session, acc["account_id"], meta_token)
+
+    if not insights:
+        return None
 
     campaigns_data = structure_insights(insights, objectives)
     if not campaigns_data:
@@ -184,26 +156,28 @@ async def process_single_account(session, acc, date_str, meta_token):
         
     adsets = analyze_adsets(campaigns_data)
     
+    total_spend = sum(adset['spend'] for adset in adsets)
+    if total_spend == 0:
+        return None
+
     total_leads = sum(sum(ad['leads'] for ad in adset['ads']) for adset in adsets)
     total_clicks = sum(sum(ad['clicks'] for ad in adset['ads']) for adset in adsets)
 
-    # --- Формируем текст ---
     report_lines = ["─" * 20, f"<b>🏢 Кабинет: <u>{acc['name']}</u></b>"]
     
     cost_str = ""
     if total_leads > 0:
-        cpl = total_spend_yesterday / total_leads
+        cpl = total_spend / total_leads
         cost_str += f"Лиды: {total_leads} | Ср. CPL: ${cpl:.2f}"
     if total_clicks > 0:
-        cpc = total_spend_yesterday / total_clicks
+        cpc = total_spend / total_clicks
         if cost_str: cost_str += " | "
         cost_str += f"Клики: {total_clicks} | Ср. CPC: ${cpc:.2f}"
         
-    report_lines.append(f"`Расход: ${total_spend_yesterday:.2f}`")
+    report_lines.append(f"`Расход: ${total_spend:.2f}`")
     if cost_str:
         report_lines.append(f"`{cost_str}`")
     
-    # --- Анализ групп ---
     adsets_with_cost = sorted([a for a in adsets if a['cost'] != float('inf')], key=lambda x: x['cost'])
     
     if not adsets_with_cost:
