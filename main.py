@@ -46,9 +46,17 @@ async def get_campaigns(session: aiohttp.ClientSession, account_id: str):
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-async def get_all_adsets(session: aiohttp.ClientSession, account_id: str):
+# ### ИЗМЕНЕНИЕ: Функция теперь запрашивает ТОЛЬКО РЕАЛЬНО АКТИВНЫЕ группы
+async def get_active_adsets(session: aiohttp.ClientSession, account_id: str):
+    """Получает ТОЛЬКО активные группы объявлений, используя фильтрацию API."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/adsets"
-    params = {"fields": "id,name,campaign_id,status", "limit": 500}
+    # Используем effective_status для получения только реально работающих групп
+    filtering = [{'field': 'effective_status', 'operator': 'IN', 'value': ['ACTIVE']}]
+    params = {
+        "fields": "id,name,campaign_id",
+        "filtering": json.dumps(filtering),
+        "limit": 500
+    }
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
@@ -59,7 +67,6 @@ async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id:
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-# ### ИЗМЕНЕНИЕ: Возвращена одна простая, синхронная функция для статистики
 async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str, ad_ids: list, start_date: str):
     """Получает статистику СИНХРОННО (быстро и надежно)."""
     end_date = datetime.now().strftime("%Y-%m-%d")
@@ -209,13 +216,15 @@ async def build_report(call: CallbackQuery):
                 base_text = f"📦({idx}/{total}) Кабинет: <b>{acc['name']}</b>\n"
                 
                 try:
-                    await update_panel(chat_id, base_text + " Cкачиваю кампании и группы...")
+                    await update_panel(chat_id, base_text + " Cкачиваю кампании и активные группы...")
                     campaigns = await get_campaigns(session, acc["account_id"])
                     campaigns_map = {c['id']: c for c in campaigns}
                     
-                    adsets = await get_all_adsets(session, acc["account_id"])
-                    active_adsets = [a for a in adsets if a.get("status") == "ACTIVE"]
-                    if not active_adsets: continue
+                    # ### ИЗМЕНЕНИЕ: Сразу получаем только активные группы
+                    active_adsets = await get_active_adsets(session, acc["account_id"])
+                    if not active_adsets:
+                        continue # Если активных групп нет, сразу переходим к след. кабинету
+                    
                     adsets_map = {a['id']: a for a in active_adsets}
                     active_adset_ids = list(adsets_map.keys())
 
