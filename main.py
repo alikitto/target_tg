@@ -1,6 +1,7 @@
 import os
 import asyncio
 import aiohttp
+import json # <--- ДОБАВЛЕН ИМПОРТ
 from datetime import datetime
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, BotCommand, BotCommandScopeDefault
@@ -53,18 +54,23 @@ async def get_all_adsets(session: aiohttp.ClientSession, account_id: str):
 
 async def get_adset_insights(session: aiohttp.ClientSession, account_id: str, adset_ids: list):
     """
-    Используем time_range для получения данных за всё время,
-    чтобы соответствовать логике вашего скрипта в Google Таблицах.
+    ### ИЗМЕНЕНИЕ: Исправлена ошибка 400 Bad Request.
+    Теперь список adset_ids корректно преобразуется в JSON-строку,
+    которую понимает API Facebook.
     """
-    start_date = "2020-01-01"  # Дата, с которой начинаем считать статистику
-    end_date = datetime.now().strftime("%Y-%m-%d") # Сегодняшняя дата
+    start_date = "2020-01-01"
+    end_date = datetime.now().strftime("%Y-%m-%d")
+
+    # Преобразуем список Python в валидную JSON-строку
+    adset_ids_json_string = json.dumps(adset_ids)
 
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
     params = {
         "fields": "adset_id,spend,actions",
         "level": "adset",
-        "filtering": f'[{{"field":"adset.id","operator":"IN","value":{adset_ids}}}]',
-        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}', # <-- Ключевое изменение
+        # Используем корректно отформатированную JSON-строку
+        "filtering": f'[{{"field":"adset.id","operator":"IN","value":{adset_ids_json_string}}}]',
+        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
         "limit": 500
     }
     data = await fb_get(session, url, params)
@@ -186,6 +192,8 @@ async def build_report(event: Message | CallbackQuery):
                 if not active_adsets: continue
 
                 adset_ids = [a["id"] for a in active_adsets]
+                if not adset_ids: continue # Пропускаем, если нет активных адсетов для запроса
+
                 insights = await get_adset_insights(session, acc["account_id"], adset_ids)
 
                 spend_map, chats_map = {}, {}
@@ -215,7 +223,8 @@ async def build_report(event: Message | CallbackQuery):
                     active_accounts_data.append({"name": acc["name"], "campaigns": list(campaigns_data.values()), "active_count": len(campaigns_data)})
     
     except aiohttp.ClientResponseError as e:
-        await status_msg.edit_text(f"❌ <b>Ошибка API Facebook:</b>\nКод: {e.status}\nСообщение: {e.message}")
+        error_details = await e.json() if e.content_type == 'application/json' else e.reason
+        await status_msg.edit_text(f"❌ <b>Ошибка API Facebook:</b>\nКод: {e.status}\nСообщение: {error_details}")
         return
     except Exception as e:
         await status_msg.edit_text(f"❌ <b>Произошла неизвестная ошибка:</b>\n{e}")
@@ -256,4 +265,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Бот остановлен вручную.")
-
