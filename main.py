@@ -198,17 +198,10 @@ async def help_handler(message: Message):
 async def daily_report_handler(message: Message):
     status_msg = await message.answer("⏳ Собираю дневную сводку, это может занять до минуты...")
     try:
-        # 1. Открываем сессию для запросов к API
-        async with aiohttp.ClientSession() as session:
-            # 2. Получаем список аккаунтов
-            accounts = await get_ad_accounts(session)
-
-        if not accounts:
-            await status_msg.edit_text("❌ Не найдено ни одного рекламного аккаунта.")
-            return
 
         # 3. Вызываем функцию, ПЕРЕДАВАЯ ей аккаунты и токен
-        report_text = await generate_daily_report_text(accounts, META_TOKEN)
+                report_text = await generate_daily_report_text()
+
 
         # Удаляем сообщение "Собираю..."
         await bot.delete_message(message.chat.id, status_msg.message_id)
