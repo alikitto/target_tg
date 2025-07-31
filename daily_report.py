@@ -2,9 +2,10 @@ import os
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
+import json  # <--- 1. ДОБАВЛЕН ЭТОТ ИМПОРТ
+from dotenv import load_dotenv
 
 # --- Конфигурация ---
-from dotenv import load_dotenv
 load_dotenv()
 API_VERSION = "v19.0"
 META_TOKEN = os.getenv("META_ACCESS_TOKEN")
@@ -27,7 +28,7 @@ async def get_insights_for_range(session: aiohttp.ClientSession, account_id: str
     params = {
         "fields": "campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,actions,ctr,objective",
         "level": "ad",
-        "time_range": time_range,
+        "time_range": json.dumps(time_range),  # <--- 2. ИСПРАВЛЕНА ЭТА СТРОКА
         "limit": 2000
     }
     data = await fb_get(session, url, params=params)
@@ -62,17 +63,18 @@ def process_insights_data(insights: list):
         
     return data
 
-def get_change_indicator(new, old):
+def get_change_indicator(new, old, is_cost=False):
     """Возвращает строку с процентом изменения и эмодзи."""
-    if old == 0 and new > 0:
-        return "(📈)"
     if old == 0:
-        return ""
+        return "(новая)" if new > 0 else ""
         
     percent_change = ((new - old) / old) * 100
-    emoji = "📈" if new > old else "📉"
+    
     # Для CPL/CPC инвертируем логику: рост - это плохо
-    if "cpl" in str(old): emoji = "📈" if new > old else "📉" # just a trick
+    if is_cost:
+        emoji = "📈" if new > old else "📉"
+    else:
+        emoji = "📈" if new > old else "📉"
     
     return f"({emoji} {percent_change:+.0f}%)"
 
@@ -91,7 +93,7 @@ def format_summary(data_yesterday, data_before_yesterday):
 
     spend_change = get_change_indicator(y_spend, by_spend)
     leads_change = get_change_indicator(y_leads, by_leads)
-    cpl_change = get_change_indicator(y_cpl, by_cpl) if by_cpl > 0 else ""
+    cpl_change = get_change_indicator(y_cpl, by_cpl, is_cost=True)
 
     lines = [
         "<b>📊 Общая статистика:</b>",
@@ -107,7 +109,10 @@ def format_key_campaigns(data_yesterday):
     
     campaign_perf = []
     for camp_id, data in data_yesterday.items():
-        if "TRAFFIC" in data['objective'].upper() or "LINK_CLICKS" in data['objective'].upper():
+        # Определяем, что считать основной метрикой стоимости
+        is_traffic = "TRAFFIC" in data['objective'].upper() or "LINK_CLICKS" in data['objective'].upper()
+        
+        if is_traffic:
             cost = (data['spend'] / data['clicks']) if data['clicks'] > 0 else float('inf')
             metric = "CPC"
         else:
@@ -133,6 +138,7 @@ def format_key_campaigns(data_yesterday):
 def format_notifications(data_yesterday, data_before_yesterday):
     """Создает список уведомлений и алертов."""
     alerts = []
+    # Проверяем рост CPL
     for camp_id, y_data in data_yesterday.items():
         if camp_id in data_before_yesterday:
             by_data = data_before_yesterday[camp_id]
@@ -140,9 +146,14 @@ def format_notifications(data_yesterday, data_before_yesterday):
             y_cpl = (y_data['spend'] / y_data['leads']) if y_data['leads'] > 0 else 0
             by_cpl = (by_data['spend'] / by_data['leads']) if by_data['leads'] > 0 else 0
 
-            if by_cpl > 0 and y_cpl > (by_cpl * 1.5): # Если CPL вырос более чем на 50%
+            if by_cpl > 0.1 and y_cpl > (by_cpl * 1.5): # Если CPL был больше 10 центов и вырос на 50%
                 growth = ((y_cpl - by_cpl) / by_cpl) * 100
-                alerts.append(f"🔴 <b>Внимание!</b> В кампании \"{y_data['name']}\" CPL вырос на {growth:.0f}%!")
+                alerts.append(f"🔴 <b>Внимание!</b> В кампании \"{y_data['name']}\" CPL вырос на {growth:.0f}% до ${y_cpl:.2f}!")
+
+    # Проверяем кампании, которые остановились
+    for camp_id, by_data in data_before_yesterday.items():
+        if camp_id not in data_yesterday and by_data['spend'] > 1: # Если кампания вчера потратила >$1, а сегодня нет
+            alerts.append(f"🟡 Кампания \"{by_data['name']}\" вчера не имела затрат.")
 
     if not alerts:
         alerts.append("✅ Не обнаружено критических изменений.")
@@ -155,7 +166,6 @@ def format_notifications(data_yesterday, data_before_yesterday):
 async def generate_daily_report_text() -> str:
     """Главная функция, которая собирает все данные и формирует итоговый отчет."""
     
-    # Определяем временные рамки
     today = datetime.now()
     yesterday_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
     before_yesterday_str = (today - timedelta(days=2)).strftime('%Y-%m-%d')
@@ -168,14 +178,13 @@ async def generate_daily_report_text() -> str:
 
     timeout = aiohttp.ClientTimeout(total=300)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        accounts = await fb_get(session, f"https://graph.facebook.com/{API_VERSION}/me/adaccounts", {"fields": "name,account_id"})
-        accounts = accounts.get("data", [])
+        accounts_response = await fb_get(session, f"https://graph.facebook.com/{API_VERSION}/me/adaccounts", {"fields": "name,account_id"})
+        accounts = accounts_response.get("data", [])
         
         if not accounts: return "❌ Не найдено ни одного рекламного аккаунта."
 
         for acc in accounts:
             try:
-                # Получаем данные за оба дня
                 y_insights = await get_insights_for_range(session, acc['account_id'], time_range_yesterday)
                 by_insights = await get_insights_for_range(session, acc['account_id'], time_range_before_yesterday)
                 all_insights_yesterday.extend(y_insights)
@@ -183,14 +192,13 @@ async def generate_daily_report_text() -> str:
             except Exception as e:
                 print(f"Ошибка при получении данных для аккаунта {acc['name']}: {e}")
 
-    # Обрабатываем данные
     processed_yesterday = process_insights_data(all_insights_yesterday)
-    processed_before_yesterday = process_insights_data(all_insights_before_yesterday)
 
     if not processed_yesterday:
         return "✅ За вчерашний день не было активности ни в одном из кабинетов."
     
-    # Собираем отчет по частям
+    processed_before_yesterday = process_insights_data(all_insights_before_yesterday)
+    
     report_date_str = (today - timedelta(days=1)).strftime('%d %B %Y')
     prev_date_str = (today - timedelta(days=2)).strftime('%d %B')
     
@@ -199,7 +207,6 @@ async def generate_daily_report_text() -> str:
     key_campaigns_block = format_key_campaigns(processed_yesterday)
     notifications_block = format_notifications(processed_yesterday, processed_before_yesterday)
     
-    # Соединяем все в один отчет
     final_report = "\n\n".join(filter(None, [header, summary_block, key_campaigns_block, notifications_block]))
     
     return final_report
