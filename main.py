@@ -10,6 +10,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
+from daily_report import generate_daily_report_text # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
 
 # --- Конфигурация и константы ---
 load_dotenv()
@@ -191,10 +192,31 @@ async def help_handler(message: Message):
     )
     await message.answer(help_text)
 
-@router.message(F.text.in_({"📈 Дневной отчёт", "💡 Рекомендации (AI)"}))
-async def future_functions_handler(message: Message):
-    """Реагирует на кнопки функций, которые находятся в разработке."""
-    await message.answer(f"Вы выбрали: {message.text}\n\nЭтот функционал будет добавлен в следующих версиях бота.")
+
+
+@router.message(F.text == "📈 Дневной отчёт")
+async def daily_report_handler(message: Message):
+    """
+    Запускает формирование дневного отчета из файла daily_report.py
+    """
+    status_msg = await message.answer("⏳ Собираю дневную сводку, это может занять до минуты...")
+    try:
+        # Эта функция должна быть в вашем файле daily_report.py
+        report_text = await generate_daily_report_text()
+
+        # Удаляем сообщение "Собираю..."
+        await bot.delete_message(message.chat.id, status_msg.message_id)
+
+        # Разбиваем на части, если отчёт слишком длинный
+        if len(report_text) > 4096:
+            for x in range(0, len(report_text), 4096):
+                await message.answer(report_text[x:x+4096])
+        else:
+            await message.answer(report_text)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Произошла ошибка при создании дневного отчёта:\n`{type(e).__name__}: {e}`")
+
 
 @router.message(Command("clear"))
 async def clear_chat_command_handler(message: Message):
