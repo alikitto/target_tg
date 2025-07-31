@@ -110,7 +110,9 @@ async def update_panel(chat_id: int, text: str, **kwargs):
             msg = await bot.send_message(chat_id, text, **kwargs)
             session["panel_id"] = msg.message_id
         else:
-            raise e
+            # Игнорируем другие ошибки, чтобы бот не падал
+            print(f"Error updating panel: {e}")
+
 
 # ============================
 # ===         Меню         ===
@@ -224,8 +226,15 @@ async def build_report(call: CallbackQuery):
                     
                     ad_ids = [ad['id'] for ad in ads]
                     
-                    await update_panel(chat_id, base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
-                    insights = await get_ad_level_insights(session, acc["account_id"], ad_ids, start_date, end_date)
+                    # ### ИЗМЕНЕНИЕ: Запрос статистики небольшими порциями (батчами)
+                    insights = []
+                    batch_size = 40 # Безопасный размер порции
+                    for i in range(0, len(ad_ids), batch_size):
+                        batch_ad_ids = ad_ids[i:i + batch_size]
+                        progress_text = f" Cкачиваю статистику ({i + len(batch_ad_ids)}/{len(ad_ids)})..."
+                        await update_panel(chat_id, base_text + progress_text)
+                        insights_batch = await get_ad_level_insights(session, acc["account_id"], batch_ad_ids, start_date, end_date)
+                        insights.extend(insights_batch)
                     
                     insights_map = {}
                     for row in insights:
