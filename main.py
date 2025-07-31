@@ -46,17 +46,10 @@ async def get_campaigns(session: aiohttp.ClientSession, account_id: str):
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-# ### ИЗМЕНЕНИЕ: Функция теперь запрашивает ТОЛЬКО РЕАЛЬНО АКТИВНЫЕ группы
 async def get_active_adsets(session: aiohttp.ClientSession, account_id: str):
-    """Получает ТОЛЬКО активные группы объявлений, используя фильтрацию API."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/adsets"
-    # Используем effective_status для получения только реально работающих групп
     filtering = [{'field': 'effective_status', 'operator': 'IN', 'value': ['ACTIVE']}]
-    params = {
-        "fields": "id,name,campaign_id",
-        "filtering": json.dumps(filtering),
-        "limit": 500
-    }
+    params = {"fields": "id,name,campaign_id", "filtering": json.dumps(filtering), "limit": 500}
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
@@ -67,8 +60,27 @@ async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id:
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
+# ### ИЗМЕНЕНИЕ: Две функции для умной проверки и получения статистики
+async def get_delivering_adset_ids(session: aiohttp.ClientSession, account_id: str, adset_ids: list, start_date: str):
+    """Быстро проверяет, у каких групп были траты, и возвращает их ID."""
+    if not adset_ids:
+        return []
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    adset_ids_json_string = json.dumps(adset_ids)
+    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
+    params = {
+        "fields": "adset_id,spend",
+        "level": "adset",
+        "filtering": f'[{{"field":"adset.id","operator":"IN","value":{adset_ids_json_string}}}]',
+        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
+        "limit": 1000
+    }
+    data = await fb_get(session, url, params)
+    insights = data.get("data", [])
+    return [i['adset_id'] for i in insights if float(i.get('spend', 0)) > 0]
+
 async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str, ad_ids: list, start_date: str):
-    """Получает статистику СИНХРОННО (быстро и надежно)."""
+    """Получает детальную статистику для объявлений, которые точно работают."""
     end_date = datetime.now().strftime("%Y-%m-%d")
     ad_ids_json_string = json.dumps(ad_ids)
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
@@ -124,18 +136,8 @@ async def set_bot_commands(bot: Bot):
 
 def inline_main_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📊 Отчёт: Активные кампании", callback_data="select_report_period")
+    kb.button(text="📊 Отчёт (с 1 июня 2025)", callback_data="build_report")
     kb.button(text="🧹 Очистить временные сообщения", callback_data="clear_chat")
-    return kb.as_markup()
-
-def inline_period_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="За сегодня", callback_data="report_period:today")
-    kb.button(text="За 7 дней", callback_data="report_period:week")
-    kb.button(text="За 30 дней", callback_data="report_period:month")
-    kb.button(text="С 1 июня 2025", callback_data="report_period:all_time")
-    kb.button(text="⬅️ Назад", callback_data="show_menu")
-    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 # ============================
@@ -145,12 +147,6 @@ def inline_period_menu():
 async def start_handler(msg: Message):
     text = "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:"
     await update_panel(msg.chat.id, text, reply_markup=inline_main_menu())
-
-@router.callback_query(F.data == "show_menu")
-async def show_menu_handler(call: CallbackQuery):
-    text = "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:"
-    await update_panel(call.message.chat.id, text, reply_markup=inline_main_menu())
-    await call.answer()
 
 @router.message(Command("clear"))
 @router.callback_query(F.data == "clear_chat")
@@ -179,25 +175,11 @@ async def clear_chat_handler(event: Message | CallbackQuery):
         except TelegramBadRequest:
             pass
 
-@router.callback_query(F.data == "select_report_period")
-async def select_period_handler(call: CallbackQuery):
-    await update_panel(call.message.chat.id, "🗓️ Выберите период для отчета:", reply_markup=inline_period_menu())
-    await call.answer()
-
-@router.callback_query(F.data.startswith("report_period:"))
-async def build_report(call: CallbackQuery):
-    chat_id = call.message.chat.id
-    period = call.data.split(":")[1]
-
-    today = datetime.now()
-    if period == 'today':
-        start_date = today.strftime("%Y-%m-%d")
-    elif period == 'week':
-        start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
-    elif period == 'month':
-        start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
-    else: # all_time
-        start_date = "2025-06-01"
+@router.message(Command("report"))
+@router.callback_query(F.data == "build_report")
+async def build_report(event: Message | CallbackQuery):
+    chat_id = event.message.chat.id
+    start_date = "2025-06-01"
 
     await update_panel(chat_id, "⏳ Начинаю сбор данных...")
     all_accounts_data = {}
@@ -213,23 +195,26 @@ async def build_report(call: CallbackQuery):
 
             total = len(accounts)
             for idx, acc in enumerate(accounts, start=1):
-                base_text = f"📦({idx}/{total}) Кабинет: <b>{acc['name']}</b>\n"
+                base_text = f"�({idx}/{total}) Кабинет: <b>{acc['name']}</b>\n"
                 
                 try:
-                    await update_panel(chat_id, base_text + " Cкачиваю кампании и активные группы...")
+                    await update_panel(chat_id, base_text + " Поиск активных групп...")
                     campaigns = await get_campaigns(session, acc["account_id"])
                     campaigns_map = {c['id']: c for c in campaigns}
                     
-                    # ### ИЗМЕНЕНИЕ: Сразу получаем только активные группы
-                    active_adsets = await get_active_adsets(session, acc["account_id"])
-                    if not active_adsets:
-                        continue # Если активных групп нет, сразу переходим к след. кабинету
+                    all_active_adsets = await get_active_adsets(session, acc["account_id"])
+                    if not all_active_adsets: continue
                     
-                    adsets_map = {a['id']: a for a in active_adsets}
-                    active_adset_ids = list(adsets_map.keys())
+                    # ### ИЗМЕНЕНИЕ: Проверяем, у каких групп были траты
+                    all_adset_ids = [a['id'] for a in all_active_adsets]
+                    delivering_adset_ids = await get_delivering_adset_ids(session, acc["account_id"], all_adset_ids, start_date)
+                    
+                    if not delivering_adset_ids: continue # Если нет групп с тратами, пропускаем кабинет
 
+                    adsets_map = {a['id']: a for a in all_active_adsets if a['id'] in delivering_adset_ids}
+                    
                     await update_panel(chat_id, base_text + " Cкачиваю объявления...")
-                    ads = await get_all_ads_with_creatives(session, acc["account_id"], active_adset_ids)
+                    ads = await get_all_ads_with_creatives(session, acc["account_id"], delivering_adset_ids)
                     if not ads: continue
                     
                     ad_ids = [ad['id'] for ad in ads]
@@ -333,3 +318,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Бот остановлен вручную.")
+�
