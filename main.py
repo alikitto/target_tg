@@ -22,7 +22,9 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 router = Router()
 
-sent_messages_by_chat = {}
+# ### ИЗМЕНЕНИЕ: Словарь для хранения ID сообщений и главного "пульта"
+# Ключ - chat_id, значение - словарь с 'messages' и 'panel_id'
+chat_sessions = {}
 
 # ============================
 # ===         API          ===
@@ -52,9 +54,7 @@ async def get_all_adsets(session: aiohttp.ClientSession, account_id: str):
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-# ### ИЗМЕНЕНИЕ: Новая функция для получения объявлений с креативами
 async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id: str, active_adset_ids: list):
-    """Получает все активные объявления для указанных групп с их креативами."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/ads"
     filtering = [
         {'field': 'adset.id', 'operator': 'IN', 'value': active_adset_ids},
@@ -68,15 +68,14 @@ async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id:
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-# ### ИЗМЕНЕНИЕ: Функция для получения статистики на уровне объявлений
+# ### ИЗМЕНЕНИЕ: Запрашиваем клики для расчета CPC
 async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str, ad_ids: list):
-    """Получает статистику для конкретных объявлений."""
     start_date = "2025-06-01"
     end_date = datetime.now().strftime("%Y-%m-%d")
     ad_ids_json_string = json.dumps(ad_ids)
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
     params = {
-        "fields": "ad_id,spend,actions,ctr",
+        "fields": "ad_id,spend,actions,ctr,link_clicks", # Добавили link_clicks
         "level": "ad",
         "filtering": f'[{{"field":"ad.id","operator":"IN","value":{ad_ids_json_string}}}]',
         "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
@@ -85,35 +84,53 @@ async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str,
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-
 # ============================
 # ===      Помощники       ===
 # ============================
-def cpl_label(cpl: float) -> str:
-    if cpl <= 1: return "🟢 Дешёвый"
-    if cpl <= 3: return "🟡 Средний"
+def get_session(chat_id: int):
+    """Получает или создает сессию для чата."""
+    if chat_id not in chat_sessions:
+        chat_sessions[chat_id] = {"messages": [], "panel_id": None}
+    return chat_sessions[chat_id]
+
+def metric_label(value: float) -> str:
+    """Универсальная метка для CPL/CPC."""
+    if value <= 1: return "🟢 Дешёвый"
+    if value <= 3: return "🟡 Средний"
     return "🔴 Дорогой"
 
-async def send_and_store(message: Message | CallbackQuery, text: str, *, is_persistent: bool = False, **kwargs):
-    msg_obj = message.message if isinstance(message, CallbackQuery) else message
-    # Отключаем предпросмотр ссылок, чтобы не загромождать чат
-    kwargs.setdefault('disable_web_page_preview', True)
-    msg = await msg_obj.answer(text, **kwargs)
-    chat_id = msg.chat.id
-    if chat_id not in sent_messages_by_chat:
-        sent_messages_by_chat[chat_id] = []
-    sent_messages_by_chat[chat_id].append({"id": msg.message_id, "persistent": is_persistent})
-    return msg
+async def store_message_id(chat_id: int, message_id: int):
+    """Сохраняет ID временного сообщения."""
+    session = get_session(chat_id)
+    session["messages"].append(message_id)
+
+async def update_panel(chat_id: int, text: str, **kwargs):
+    """Обновляет или создает главную панель управления."""
+    session = get_session(chat_id)
+    panel_id = session.get("panel_id")
+    try:
+        if panel_id:
+            await bot.edit_message_text(text, chat_id, panel_id, **kwargs)
+        else:
+            msg = await bot.send_message(chat_id, text, **kwargs)
+            session["panel_id"] = msg.message_id
+    except TelegramBadRequest as e:
+        if "message to edit not found" in e.message or "message is not modified" in e.message:
+            # Если старую панель не нашли (удалили вручную), создаем новую
+            msg = await bot.send_message(chat_id, text, **kwargs)
+            session["panel_id"] = msg.message_id
+        else:
+            # Другие ошибки (например, неправильный HTML) пробрасываем дальше
+            raise e
 
 # ============================
 # ===         Меню         ===
 # ============================
 async def set_bot_commands(bot: Bot):
     commands = [
-        BotCommand(command="start", description="🚀 Запустить бота / Показать меню"),
-        BotCommand(command="report", description="📊 Отчёт по активным кампаниям"),
+        BotCommand(command="start", description="🚀 Показать пульт управления"),
+        BotCommand(command="report", description="📊 Запросить отчёт"),
         BotCommand(command="clear", description="🧹 Очистить временные сообщения"),
-        BotCommand(command="help", description="ℹ️ Помощь"),
     ]
     await bot.set_my_commands(commands, BotCommandScopeDefault())
 
@@ -121,8 +138,6 @@ def inline_main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Отчёт: Активные кампании", callback_data="build_report")
     kb.button(text="🧹 Очистить временные сообщения", callback_data="clear_chat")
-    kb.button(text="ℹ️ Помощь", callback_data="help")
-    kb.adjust(1)
     return kb.as_markup()
 
 # ============================
@@ -130,57 +145,53 @@ def inline_main_menu():
 # ============================
 @router.message(Command("start", "restart"))
 async def start_handler(msg: Message):
-    await send_and_store(msg, "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:", is_persistent=True, reply_markup=inline_main_menu())
+    text = "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:"
+    await update_panel(msg.chat.id, text, reply_markup=inline_main_menu())
 
 @router.callback_query(F.data == "show_menu")
 async def show_menu_handler(call: CallbackQuery):
-    await call.message.edit_text("👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:", reply_markup=inline_main_menu())
-    chat_id = call.message.chat.id
-    if chat_id in sent_messages_by_chat:
-        for msg_info in sent_messages_by_chat[chat_id]:
-            if msg_info["id"] == call.message.message_id:
-                msg_info["persistent"] = True
-                break
-
-@router.message(Command("help"))
-@router.callback_query(F.data == "help")
-async def help_handler(event: Message | CallbackQuery):
-    help_text = (
-        "<b>ℹ️ Справка по командам:</b>\n\n"
-        "<b>/start</b> - Показать главное меню.\n"
-        "<b>/report</b> - Сформировать отчёт по активным кампаниям.\n"
-        "<b>/clear</b> - Удалить временные сообщения (отчёты, статусы загрузки), оставив меню и важные уведомления.\n\n"
-        "Бот использует API Facebook для получения данных в реальном времени."
-    )
-    await send_and_store(event, help_text, is_persistent=True, reply_markup=inline_main_menu())
+    text = "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:"
+    await update_panel(call.message.chat.id, text, reply_markup=inline_main_menu())
+    await call.answer()
 
 @router.message(Command("clear"))
 @router.callback_query(F.data == "clear_chat")
 async def clear_chat_handler(event: Message | CallbackQuery):
-    message = event.message if isinstance(event, CallbackQuery) else event
-    chat_id = message.chat.id
-    if chat_id in sent_messages_by_chat and sent_messages_by_chat[chat_id]:
-        messages_to_delete = [msg_info["id"] for msg_info in sent_messages_by_chat[chat_id] if not msg_info.get("persistent", False)]
-        sent_messages_by_chat[chat_id] = [msg_info for msg_info in sent_messages_by_chat[chat_id] if msg_info.get("persistent", False)]
-        count = 0
-        for msg_id in messages_to_delete:
-            try:
-                await bot.delete_message(chat_id, msg_id)
-                count += 1
-            except TelegramBadRequest:
-                pass
-        await message.answer(f"✅ Готово! Удалил {count} временных сообщений.")
-    else:
-        await message.answer("ℹ️ Сообщений для удаления нет.")
+    chat_id = event.message.chat.id
+    session = get_session(chat_id)
+    messages_to_delete = session["messages"].copy()
+    session["messages"] = []
+    
+    count = 0
+    for msg_id in messages_to_delete:
+        try:
+            await bot.delete_message(chat_id, msg_id)
+            count += 1
+        except TelegramBadRequest:
+            pass
+    
+    confirmation_text = f"✅ Готово! Удалил {count} временных сообщений."
+    menu_text = "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:"
+    await update_panel(chat_id, menu_text, reply_markup=inline_main_menu())
+    
     if isinstance(event, CallbackQuery):
-        await start_handler(message)
+        await event.answer(confirmation_text, show_alert=True)
+    else:
+        # Отправляем и сразу сохраняем для удаления
+        msg = await event.answer(confirmation_text)
+        await asyncio.sleep(5)
+        try:
+            await bot.delete_message(chat_id, msg.message_id)
+        except TelegramBadRequest:
+            pass
+
 
 # ============ Отчёт с лоадером ============
 @router.message(Command("report"))
 @router.callback_query(F.data == "build_report")
 async def build_report(event: Message | CallbackQuery):
-    message = event.message if isinstance(event, CallbackQuery) else event
-    status_msg = await send_and_store(message, "⏳ Начинаю сбор данных...")
+    chat_id = event.message.chat.id
+    await update_panel(chat_id, "⏳ Начинаю сбор данных...")
     all_accounts_data = {}
     
     timeout = aiohttp.ClientTimeout(total=120)
@@ -189,7 +200,7 @@ async def build_report(event: Message | CallbackQuery):
         async with aiohttp.ClientSession(timeout=timeout) as session:
             accounts = await get_ad_accounts(session)
             if not accounts:
-                await status_msg.edit_text("❌ Нет доступных рекламных аккаунтов.")
+                await update_panel(chat_id, "❌ Нет доступных рекламных аккаунтов.", reply_markup=inline_main_menu())
                 return
 
             total = len(accounts)
@@ -197,7 +208,7 @@ async def build_report(event: Message | CallbackQuery):
                 base_text = f"📦({idx}/{total}) Кабинет: <b>{acc['name']}</b>\n"
                 
                 try:
-                    await status_msg.edit_text(base_text + " Cкачиваю кампании и группы...")
+                    await update_panel(chat_id, base_text + " Cкачиваю кампании и группы...")
                     campaigns = await get_campaigns(session, acc["account_id"])
                     campaigns_map = {c['id']: c for c in campaigns}
                     
@@ -207,12 +218,12 @@ async def build_report(event: Message | CallbackQuery):
                     adsets_map = {a['id']: a for a in active_adsets}
                     active_adset_ids = list(adsets_map.keys())
 
-                    await status_msg.edit_text(base_text + " Cкачиваю объявления...")
+                    await update_panel(chat_id, base_text + " Cкачиваю объявления...")
                     ads = await get_all_ads_with_creatives(session, acc["account_id"], active_adset_ids)
                     if not ads: continue
                     
                     ad_ids = [ad['id'] for ad in ads]
-                    await status_msg.edit_text(base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
+                    await update_panel(chat_id, base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
                     insights = await get_ad_level_insights(session, acc["account_id"], ad_ids)
                     
                     insights_map = {}
@@ -220,56 +231,38 @@ async def build_report(event: Message | CallbackQuery):
                         ad_id = row['ad_id']
                         spend = float(row.get("spend", 0))
                         leads = sum(int(a["value"]) for a in row.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE)
+                        clicks = int(row.get("link_clicks", 0))
                         ctr = float(row.get("ctr", 0))
-                        insights_map[ad_id] = {"spend": spend, "leads": leads, "ctr": ctr}
+                        insights_map[ad_id] = {"spend": spend, "leads": leads, "clicks": clicks, "ctr": ctr}
 
-                    # Структурирование данных
                     account_data = {}
                     for ad in ads:
-                        ad_id = ad['id']
-                        adset_id = ad['adset_id']
-                        campaign_id = ad.get('campaign_id')
-
-                        if adset_id not in adsets_map or campaign_id not in campaigns_map:
-                            continue
-
+                        ad_id, adset_id, campaign_id = ad['id'], ad['adset_id'], ad.get('campaign_id')
+                        if adset_id not in adsets_map or campaign_id not in campaigns_map: continue
                         stats = insights_map.get(ad_id)
-                        if not stats or (stats['spend'] == 0 and stats['leads'] == 0):
-                            continue
-                        
-                        cpl = (stats['spend'] / stats['leads']) if stats['leads'] > 0 else 0
+                        if not stats or (stats['spend'] == 0 and stats['leads'] == 0 and stats['clicks'] == 0): continue
                         
                         if campaign_id not in account_data:
                             campaign_obj = campaigns_map[campaign_id]
-                            objective_clean = campaign_obj.get("objective", "N/A").replace('OUTCOME_', '').replace('_', ' ').capitalize()
                             account_data[campaign_id] = {
                                 "name": campaign_obj['name'],
-                                "objective": objective_clean,
+                                "objective_raw": campaign_obj.get("objective", "N/A"),
                                 "adsets": {}
                             }
                         
                         if adset_id not in account_data[campaign_id]['adsets']:
-                            adset_obj = adsets_map[adset_id]
-                            account_data[campaign_id]['adsets'][adset_id] = {
-                                "name": adset_obj['name'],
-                                "ads": []
-                            }
+                            account_data[campaign_id]['adsets'][adset_id] = {"name": adsets_map[adset_id]['name'], "ads": []}
                         
                         ad_info = {
-                            "name": ad['name'],
-                            "thumbnail_url": ad.get('creative', {}).get('thumbnail_url'),
-                            "cpl": cpl,
-                            "ctr": stats['ctr'],
-                            "leads": stats['leads'],
-                            "spend": stats['spend']
+                            "name": ad['name'], "thumbnail_url": ad.get('creative', {}).get('thumbnail_url'),
+                            "ctr": stats['ctr'], "leads": stats['leads'], "clicks": stats['clicks'], "spend": stats['spend']
                         }
                         account_data[campaign_id]['adsets'][adset_id]['ads'].append(ad_info)
 
-                    if account_data:
-                        all_accounts_data[acc['name']] = account_data
-
+                    if account_data: all_accounts_data[acc['name']] = account_data
                 except asyncio.TimeoutError:
-                    await send_and_store(message, f"⚠️ <b>Превышен таймаут</b> при обработке кабинета <b>{acc['name']}</b>. Пропускаю его.")
+                    msg = await bot.send_message(chat_id, f"⚠️ <b>Превышен таймаут</b> при обработке кабинета <b>{acc['name']}</b>. Пропускаю его.")
+                    await store_message_id(chat_id, msg.message_id)
                     continue
     
     except aiohttp.ClientResponseError as e:
@@ -278,56 +271,68 @@ async def build_report(event: Message | CallbackQuery):
             try: error_details = (await e.json()).get("error", {}).get("message", "Нет сообщения")
             except: pass
         else: error_details = e.reason
-        await status_msg.edit_text(f"❌ <b>Ошибка API Facebook:</b>\nКод: {e.status}\nСообщение: {error_details}")
+        await update_panel(chat_id, f"❌ <b>Ошибка API Facebook:</b>\nКод: {e.status}\nСообщение: {error_details}", reply_markup=inline_main_menu())
         return
     except Exception as e:
-        await status_msg.edit_text(f"❌ <b>Произошла неизвестная ошибка:</b>\n{type(e).__name__}: {e}")
+        await update_panel(chat_id, f"❌ <b>Произошла неизвестная ошибка:</b>\n{type(e).__name__}: {e}", reply_markup=inline_main_menu())
         return
         
     if not all_accounts_data:
-        await status_msg.edit_text("✅ Активных кампаний с затратами или лидами не найдено.")
+        await update_panel(chat_id, "✅ Активных кампаний с затратами или лидами не найдено.", reply_markup=inline_main_menu())
         return
     
-    try: await bot.delete_message(status_msg.chat.id, status_msg.message_id)
-    except TelegramBadRequest: pass
-
-    # ### ИЗМЕНЕНИЕ: Полностью переработанный блок форматирования вывода
+    # Отправляем отчеты в отдельных сообщениях
     for acc_name, campaigns_data in all_accounts_data.items():
         active_campaign_count = len(campaigns_data)
-        msg_lines = [
-            f"<b>🏢 Рекламный кабинет:</b> <u>{acc_name}</u>",
-            f"<b>📈 Активных кампаний:</b> {active_campaign_count}",
-            "─" * 20
-        ]
+        msg_lines = [f"<b>🏢 Рекламный кабинет:</b> <u>{acc_name}</u>", f"<b>📈 Активных кампаний:</b> {active_campaign_count}", "─" * 20]
         
         for camp_id, camp_data in campaigns_data.items():
+            is_traffic = 'TRAFFIC' in camp_data['objective_raw']
+            objective_clean = camp_data['objective_raw'].replace('OUTCOME_', '').replace('_', ' ').capitalize()
             msg_lines.append(f"\n<b>🎯 Кампания:</b> {camp_data['name']}")
             
             for adset_id, adset_data in camp_data['adsets'].items():
-                # Считаем общую статистику для группы
-                total_leads = sum(ad['leads'] for ad in adset_data['ads'])
                 total_spend = sum(ad['spend'] for ad in adset_data['ads'])
-                total_cpl = (total_spend / total_leads) if total_leads > 0 else 0
                 
+                if is_traffic:
+                    total_metric_val = sum(ad['clicks'] for ad in adset_data['ads'])
+                    total_cost_per_action = (total_spend / total_metric_val) if total_metric_val > 0 else 0
+                    metric_name = "Клики"
+                    cost_name = "CPC"
+                else:
+                    total_metric_val = sum(ad['leads'] for ad in adset_data['ads'])
+                    total_cost_per_action = (total_spend / total_metric_val) if total_metric_val > 0 else 0
+                    metric_name = "Лиды"
+                    cost_name = "CPL"
+
                 adset_block = [
                     f"  <b>↳ Группа:</b> <code>{adset_data['name']}</code>",
-                    f"    - <b>Цель:</b> {camp_data['objective']}",
-                    f"    - <b>Лиды:</b> {total_leads}",
+                    f"    - <b>Цель:</b> {objective_clean}",
+                    f"    - <b>{metric_name}:</b> {total_metric_val}",
                     f"    - <b>Расход:</b> ${total_spend:.2f}",
-                    f"    - <b>CPL:</b> ${total_cpl:.2f} {cpl_label(total_cpl)}"
+                    f"    - <b>{cost_name}:</b> ${total_cost_per_action:.2f} {metric_label(total_cost_per_action)}"
                 ]
                 msg_lines.extend(adset_block)
                 
                 if adset_data['ads']:
                     msg_lines.append("  <b>↳ Объявления:</b>")
-                    for ad in sorted(adset_data['ads'], key=lambda x: x['cpl']):
+                    for ad in sorted(adset_data['ads'], key=lambda x: x['spend'], reverse=True):
                         thumb_url = ad.get('thumbnail_url', '#')
-                        ad_line = f'    <a href="{thumb_url}">🖼️</a> <b>{ad["name"]}</b> | CPL: ${ad["cpl"]:.2f} | CTR: {ad["ctr"]:.2f}%'
+                        
+                        if is_traffic:
+                            ad_cost_per_action = (ad['spend'] / ad['clicks']) if ad['clicks'] > 0 else 0
+                            ad_cost_name = "CPC"
+                        else:
+                            ad_cost_per_action = (ad['spend'] / ad['leads']) if ad['leads'] > 0 else 0
+                            ad_cost_name = "CPL"
+
+                        ad_line = f'    <a href="{thumb_url}">🖼️</a> <b>{ad["name"]}</b> | {ad_cost_name}: ${ad_cost_per_action:.2f} | CTR: {ad["ctr"]:.2f}%'
                         msg_lines.append(ad_line)
+        
+        report_msg = await bot.send_message(chat_id, "\n".join(msg_lines), parse_mode="HTML", disable_web_page_preview=True)
+        await store_message_id(chat_id, report_msg.message_id)
 
-        await send_and_store(message, "\n".join(msg_lines))
-
-    await send_and_store(message, "✅ Отчёт завершён.", is_persistent=True, reply_markup=inline_main_menu())
+    await update_panel(chat_id, "✅ Отчёт завершён. Выберите следующее действие:", reply_markup=inline_main_menu())
 
 # ============================
 # ===         Запуск       ===
