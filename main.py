@@ -2,13 +2,11 @@ import os
 import asyncio
 import requests
 from datetime import date
-from collections import defaultdict
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-import time
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -18,7 +16,7 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# --- Graph API helper ---
+# === Graph API helper ===
 def fb_get(url, params=None):
     if not params:
         params = {}
@@ -27,180 +25,108 @@ def fb_get(url, params=None):
     r.raise_for_status()
     return r.json()
 
-# --- Data collectors ---
-def get_active_adsets(ad_account_id, start_date, end_date):
-    active_filter = '[{"field":"adset.effective_status","operator":"IN","value":["ACTIVE"]}]'
-    url = f"https://graph.facebook.com/v19.0/{ad_account_id}/insights"
-    params = {
-        "fields": "campaign_id,campaign_name,adset_id,adset_name,spend,actions,ctr,cpm,impressions,frequency",
-        "level": "adset",
-        "filtering": active_filter,
-        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
-        "limit": 500
-    }
-    data = fb_get(url, params).get("data", [])
-    result = {}
-    for item in data:
-        chats = 0
-        for a in item.get("actions", []):
-            if a["action_type"] == "onsite_conversion.messaging_conversation_started_7d":
-                chats += int(a["value"])
-        result[item["adset_id"]] = {
-            "campaign_id": item["campaign_id"],
-            "campaign_name": item["campaign_name"],
-            "adset_name": item["adset_name"],
-            "totalSpend": float(item.get("spend", 0)),
-            "totalChats": chats,
-            "totalImpressions": int(item.get("impressions", 0)),
-            "avgCtr": float(item.get("ctr", 0)),
-            "avgCpm": float(item.get("cpm", 0)),
-            "frequency": float(item.get("frequency", 0)),
-            "placements": {"feed": {"spend": 0, "chats": 0}, "reels": {"spend": 0, "chats": 0}, "stories": {"spend": 0, "chats": 0}},
-            "ageBrackets": {k: {"spend": 0, "chats": 0} for k in ["18-24","25-34","35-44","45-54","55-64","65+"]}
-        }
-    return result
-
-def fill_placements(ad_account_id, adset_ids, start_date, end_date, aggregatedData):
-    adsetFilter = f'[{{"field":"adset.id","operator":"IN","value":{adset_ids}}}]'
-    url = f"https://graph.facebook.com/v19.0/{ad_account_id}/insights"
-    params = {
-        "fields": "adset_id,spend,actions,platform_position",
-        "level": "ad",
-        "breakdowns": "publisher_platform,platform_position",
-        "filtering": adsetFilter,
-        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
-        "limit": 1000
-    }
-    for item in fb_get(url, params).get("data", []):
-        adsetId = item["adset_id"]
-        if adsetId not in aggregatedData:
-            continue
-        spend = float(item.get("spend", 0))
-        chats = 0
-        for a in item.get("actions", []):
-            if a["action_type"] == "onsite_conversion.messaging_conversation_started_7d":
-                chats += int(a["value"])
-        pos = item.get("platform_position", "").lower()
-        if "feed" in pos or "marketplace" in pos:
-            aggregatedData[adsetId]["placements"]["feed"]["spend"] += spend
-            aggregatedData[adsetId]["placements"]["feed"]["chats"] += chats
-        if "reels" in pos:
-            aggregatedData[adsetId]["placements"]["reels"]["spend"] += spend
-            aggregatedData[adsetId]["placements"]["reels"]["chats"] += chats
-        if "story" in pos:
-            aggregatedData[adsetId]["placements"]["stories"]["spend"] += spend
-            aggregatedData[adsetId]["placements"]["stories"]["chats"] += chats
-
-def fill_ages(ad_account_id, adset_ids, start_date, end_date, aggregatedData):
-    adsetFilter = f'[{{"field":"adset.id","operator":"IN","value":{adset_ids}}}]'
-    url = f"https://graph.facebook.com/v19.0/{ad_account_id}/insights"
-    params = {
-        "fields": "adset_id,spend,actions,age",
-        "level": "ad",
-        "breakdowns": "age",
-        "filtering": adsetFilter,
-        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
-        "limit": 1000
-    }
-    for item in fb_get(url, params).get("data", []):
-        adsetId = item["adset_id"]
-        age = item.get("age")
-        if adsetId not in aggregatedData or age not in aggregatedData[adsetId]["ageBrackets"]:
-            continue
-        spend = float(item.get("spend", 0))
-        chats = 0
-        for a in item.get("actions", []):
-            if a["action_type"] == "onsite_conversion.messaging_conversation_started_7d":
-                chats += int(a["value"])
-        aggregatedData[adsetId]["ageBrackets"][age]["spend"] += spend
-        aggregatedData[adsetId]["ageBrackets"][age]["chats"] += chats
-
-def get_campaign_objectives(campaign_ids):
-    objectives = {}
-    for cid in campaign_ids:
-        url = f"https://graph.facebook.com/v19.0/{cid}"
-        data = fb_get(url, {"fields": "objective"})
-        objectives[cid] = data.get("objective", "").replace("OUTCOME_", "").upper()
-        time.sleep(0.2)
-    return objectives
-
-def get_adset_statuses(adset_ids):
-    statuses = {}
-    for aid in adset_ids:
-        url = f"https://graph.facebook.com/v19.0/{aid}"
-        data = fb_get(url, {"fields": "status"})
-        statuses[aid] = data.get("status", "ERR")
-        time.sleep(0.2)
-    return statuses
-
+# === Получение всех аккаунтов ===
 def get_ad_accounts():
     url = "https://graph.facebook.com/v19.0/me/adaccounts"
     data = fb_get(url, {"fields": "name,account_id"})
     return data.get("data", [])
 
-# --- Progress bar helper ---
+# === Получение всех adset текущего аккаунта ===
+def get_all_adsets(account_id):
+    url = f"https://graph.facebook.com/v19.0/act_{account_id}/adsets"
+    params = {"fields": "id,name,campaign_id,status", "limit": 500}
+    return fb_get(url, params).get("data", [])
+
+# === Получение кампаний ===
+def get_campaigns(account_id):
+    url = f"https://graph.facebook.com/v19.0/act_{account_id}/campaigns"
+    params = {"fields": "id,name,status,objective", "limit": 500}
+    return fb_get(url, params).get("data", [])
+
+# === Insights для CPL и сообщений ===
+def get_adset_insights(account_id, adset_ids):
+    url = f"https://graph.facebook.com/v19.0/act_{account_id}/insights"
+    params = {
+        "fields": "adset_id,spend,actions",
+        "level": "adset",
+        "filtering": f'[{{"field":"adset.id","operator":"IN","value":{adset_ids}}}]',
+        "limit": 500
+    }
+    return fb_get(url, params).get("data", [])
+
+# === Прогресс-бар ===
 def progress_bar(current, total, length=20):
     filled = int(length * current // total)
     return "▓" * filled + "░" * (length - filled)
 
-# --- Handlers ---
+# === /start ===
 @router.message(Command("start"))
 async def start_handler(msg: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="Собрать отчёт", callback_data="build_report")
     await msg.answer("Привет! Нажми кнопку, чтобы собрать отчёт по активным кампаниям.", reply_markup=kb.as_markup())
 
+# === Основная логика ===
 @router.callback_query(lambda c: c.data == "build_report")
 async def build_report(callback: CallbackQuery):
-    start_date = date.today().strftime("%Y-%m-%d")
-    end_date = date.today().strftime("%Y-%m-%d")
-    accounts = get_ad_accounts()
-    if not accounts:
-        await callback.message.answer("Нет рекламных аккаунтов.")
-        return
-
     status_msg = await callback.message.answer("Начинаю сбор данных…")
     await callback.answer()
 
-    report_lines_all = []
+    accounts = get_ad_accounts()
+    if not accounts:
+        await status_msg.edit_text("Нет рекламных аккаунтов.")
+        return
 
+    report_lines_all = []
     for i, acc in enumerate(accounts, start=1):
         bar = progress_bar(i, len(accounts))
-        await status_msg.edit_text(f"Собираю данные {i}/{len(accounts)} {bar}\nАккаунт: {acc['name']}")
+        await status_msg.edit_text(f"{bar}\nОбработка {i}/{len(accounts)}: {acc['name']}")
 
-        # шаги для одного аккаунта
-        await status_msg.edit_text(f"{bar}\n{acc['name']}\nШаг 1/4: Получение активных adset…")
-        aggregatedData = get_active_adsets(acc["account_id"], start_date, end_date)
-        await status_msg.edit_text(f"{bar}\n{acc['name']}\nШаг 2/4: Плейсменты…")
-        if aggregatedData:
-            adset_ids = list(aggregatedData.keys())
-            fill_placements(acc["account_id"], adset_ids, start_date, end_date, aggregatedData)
-            await status_msg.edit_text(f"{bar}\n{acc['name']}\nШаг 3/4: Возраст…")
-            fill_ages(acc["account_id"], adset_ids, start_date, end_date, aggregatedData)
-            await status_msg.edit_text(f"{bar}\n{acc['name']}\nШаг 4/4: Цели и статусы…")
-            campaign_ids = [aggregatedData[x]["campaign_id"] for x in adset_ids]
-            campaign_objectives = get_campaign_objectives(set(campaign_ids))
-            adset_statuses = get_adset_statuses(adset_ids)
+        # === Получаем кампании и adsets ===
+        campaigns = get_campaigns(acc["account_id"])
+        active_campaigns = {c["id"]: c for c in campaigns if c.get("status") == "ACTIVE"}
+        adsets = get_all_adsets(acc["account_id"])
+        active_adsets = [a for a in adsets if a.get("status") == "ACTIVE" and a.get("campaign_id") in active_campaigns]
 
-            report_lines_all.append(f"--- {acc['name']} ---")
-            for adsetId, stats in aggregatedData.items():
-                cpl = stats["totalSpend"] / stats["totalChats"] if stats["totalChats"] > 0 else 0
-                report_lines_all.append(
-                    f"{stats['campaign_name']} | {stats['adset_name']} | "
-                    f"Статус: {adset_statuses.get(adsetId,'')} | "
-                    f"Цель: {campaign_objectives.get(stats['campaign_id'],'')} | "
-                    f"Лидов: {stats['totalChats']} | CPL: ${cpl:.2f} | "
-                    f"Расход: ${stats['totalSpend']:.2f}"
-                )
-        else:
+        if not active_adsets:
             report_lines_all.append(f"--- {acc['name']} --- Нет активных кампаний.")
+            continue
+
+        # === Insights по активным adsets ===
+        adset_ids = [a["id"] for a in active_adsets]
+        insights = get_adset_insights(acc["account_id"], adset_ids)
+        spend_map = {}
+        chats_map = {}
+        for row in insights:
+            adset_id = row["adset_id"]
+            spend = float(row.get("spend", 0))
+            chats = 0
+            for action in row.get("actions", []):
+                if action["action_type"] == "onsite_conversion.messaging_conversation_started_7d":
+                    chats += int(action["value"])
+            spend_map[adset_id] = spend
+            chats_map[adset_id] = chats
+
+        # === Формируем отчёт ===
+        report_lines_all.append(f"--- {acc['name']} ---")
+        for ad in active_adsets:
+            spend = spend_map.get(ad["id"], 0)
+            chats = chats_map.get(ad["id"], 0)
+            cpl = (spend / chats) if chats > 0 else 0
+            campaign = active_campaigns.get(ad["campaign_id"], {})
+            report_lines_all.append(
+                f"{campaign.get('name','')} | {ad['name']} | "
+                f"Статус: {ad.get('status')} | Цель: {campaign.get('objective','')} | "
+                f"Лидов: {chats} | CPL: ${cpl:.2f} | Расход: ${spend:.2f}"
+            )
+        await asyncio.sleep(0.5)
 
     await status_msg.edit_text("Отчёт готов. Отправляю данные…")
     await callback.message.answer("\n".join(report_lines_all))
     await status_msg.edit_text("Готово ✅")
 
+# === Запуск ===
 dp.include_router(router)
-
 async def main():
     await dp.start_polling(bot)
 
