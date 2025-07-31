@@ -1,7 +1,7 @@
 import os
 import asyncio
 import requests
-from datetime import date
+from datetime import date, timedelta
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, CallbackQuery
@@ -9,7 +9,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
-# === Загрузка .env ===
+# === Загружаем токен ===
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 META_TOKEN = os.getenv("META_ACCESS_TOKEN")
@@ -18,15 +18,18 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# === Запрос активных групп через Insights ===
+# === Получаем активные кампании (через Insights) ===
 def get_active_campaigns(ad_account_id):
-    today = date.today().strftime("%Y-%m-%d")
+    # Диапазон дат (последние 30 дней)
+    since = (date.today() - timedelta(days=30)).strftime("%Y-%m-%d")
+    until = date.today().strftime("%Y-%m-%d")
+
     url = f"https://graph.facebook.com/v19.0/{ad_account_id}/insights"
     params = {
         "fields": "campaign_id,campaign_name,spend,actions",
         "level": "adset",
         "filtering": '[{"field":"adset.effective_status","operator":"IN","value":["ACTIVE"]}]',
-        "time_range": f'{{"since":"{today}","until":"{today}"}}',
+        "time_range": f'{{"since":"{since}","until":"{until}"}}',
         "access_token": META_TOKEN
     }
     r = requests.get(url, params=params).json()
@@ -47,7 +50,6 @@ def get_active_campaigns(ad_account_id):
         campaigns[cid]["spend"] += spend
         campaigns[cid]["leads"] += leads
 
-    # Формируем список с CPL
     result = []
     for cid, stats in campaigns.items():
         cpl = round(stats["spend"] / stats["leads"], 2) if stats["leads"] > 0 else 0
@@ -60,25 +62,25 @@ def get_active_campaigns(ad_account_id):
         })
     return result
 
-# === Получение аккаунтов ===
+# === Получаем аккаунты (от твоего пользователя) ===
 def get_ad_accounts():
     url = "https://graph.facebook.com/v19.0/me/adaccounts"
     params = {"fields": "name,account_id", "access_token": META_TOKEN}
     r = requests.get(url, params=params).json()
     return r.get("data", [])
 
-# === Хендлеры ===
+# === Команды бота ===
 @router.message(Command("start"))
 async def start_handler(msg: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="Показать активные кампании", callback_data="show_active_all")
-    await msg.answer("Привет! Что хочешь сделать?", reply_markup=kb.as_markup())
+    await msg.answer("Привет! Этот бот работает только для твоего аккаунта Meta Ads.\nВыбери действие:", reply_markup=kb.as_markup())
 
 @router.callback_query(lambda c: c.data == "show_active_all")
 async def show_active_all(callback: CallbackQuery):
     accounts = get_ad_accounts()
     if not accounts:
-        await callback.message.answer("Аккаунты не найдены.")
+        await callback.message.answer("Аккаунты не найдены или нет доступа.")
         await callback.answer()
         return
 
@@ -93,13 +95,13 @@ async def show_active_all(callback: CallbackQuery):
                     f"   Расход: ${c['spend']} | Лидов: {c['leads']} | CPL: ${c['cpl']}\n"
                 )
         else:
-            result_text.append(f"--- {acc['name']} --- Нет активных кампаний")
+            result_text.append(f"--- {acc['name']} --- Нет активных кампаний за последние 30 дней")
 
     await callback.message.answer("\n".join(result_text))
     await callback.answer()
 
-# === Запуск ===
 dp.include_router(router)
+
 async def main():
     await dp.start_polling(bot)
 
