@@ -2,7 +2,7 @@ import os
 import asyncio
 import aiohttp
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, BotCommand, BotCommandScopeDefault
 from aiogram.filters import Command
@@ -66,11 +66,8 @@ async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id:
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-# ### ИЗМЕНЕНИЕ: Функции для асинхронных отчетов
-async def start_async_insights_job(session: aiohttp.ClientSession, account_id: str, ad_ids: list):
+async def start_async_insights_job(session: aiohttp.ClientSession, account_id: str, ad_ids: list, start_date: str):
     """Отправляет запрос на создание отчета в фоновом режиме."""
-    # ### ИЗМЕНЕНИЕ: Установлена дата начала отчета, как вы и просили.
-    start_date = "2025-06-01"
     end_date = datetime.now().strftime("%Y-%m-%d")
     ad_ids_json_string = json.dumps(ad_ids)
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
@@ -151,8 +148,19 @@ async def set_bot_commands(bot: Bot):
 
 def inline_main_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📊 Отчёт: Активные кампании", callback_data="build_report")
-    kb.button(text="� Очистить временные сообщения", callback_data="clear_chat")
+    kb.button(text="📊 Отчёт: Активные кампании", callback_data="select_report_period")
+    kb.button(text="🧹 Очистить временные сообщения", callback_data="clear_chat")
+    return kb.as_markup()
+
+# ### ИЗМЕНЕНИЕ: Новое меню для выбора периода отчета
+def inline_period_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="За сегодня", callback_data="report_period:today")
+    kb.button(text="За 7 дней", callback_data="report_period:week")
+    kb.button(text="За 30 дней", callback_data="report_period:month")
+    kb.button(text="С 1 июня 2025", callback_data="report_period:all_time")
+    kb.button(text="⬅️ Назад", callback_data="show_menu")
+    kb.adjust(2, 2, 1) # Красиво располагаем кнопки
     return kb.as_markup()
 
 # ============================
@@ -196,15 +204,33 @@ async def clear_chat_handler(event: Message | CallbackQuery):
         except TelegramBadRequest:
             pass
 
-# ============ Отчёт с лоадером ============
-@router.message(Command("report"))
-@router.callback_query(F.data == "build_report")
-async def build_report(event: Message | CallbackQuery):
-    chat_id = event.message.chat.id
+# ### ИЗМЕНЕНИЕ: Хендлер для показа меню выбора периода
+@router.callback_query(F.data == "select_report_period")
+async def select_period_handler(call: CallbackQuery):
+    await update_panel(call.message.chat.id, "🗓️ Выберите период для отчета:", reply_markup=inline_period_menu())
+    await call.answer()
+
+# ### ИЗМЕНЕНИЕ: Основной хендлер теперь запускается после выбора периода
+@router.callback_query(F.data.startswith("report_period:"))
+async def build_report(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    period = call.data.split(":")[1]
+
+    # Определяем дату начала в зависимости от выбора
+    today = datetime.now()
+    if period == 'today':
+        start_date = today.strftime("%Y-%m-%d")
+    elif period == 'week':
+        start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    elif period == 'month':
+        start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    else: # all_time
+        start_date = "2025-06-01"
+
     await update_panel(chat_id, "⏳ Начинаю сбор данных...")
     all_accounts_data = {}
     
-    timeout = aiohttp.ClientTimeout(total=300) # Увеличим общий таймаут на всякий случай
+    timeout = aiohttp.ClientTimeout(total=300)
     
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -234,7 +260,7 @@ async def build_report(event: Message | CallbackQuery):
                     
                     ad_ids = [ad['id'] for ad in ads]
                     await update_panel(chat_id, base_text + f" Запускаю асинхронный отчет для {len(ad_ids)} объявлений...")
-                    report_run_id = await start_async_insights_job(session, acc["account_id"], ad_ids)
+                    report_run_id = await start_async_insights_job(session, acc["account_id"], ad_ids, start_date)
 
                     if not report_run_id:
                         msg = await bot.send_message(chat_id, f"⚠️ Не удалось запустить отчет для кабинета <b>{acc['name']}</b>.")
