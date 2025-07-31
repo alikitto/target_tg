@@ -10,7 +10,7 @@ load_dotenv()
 API_VERSION = "v19.0"
 META_TOKEN = os.getenv("META_ACCESS_TOKEN")
 LEAD_ACTION_TYPE = "onsite_conversion.messaging_conversation_started_7d"
-LINK_CLICK_ACTION_TYPE = "link_click"
+LINK_CLICK_ACTION_TYPE = "link_click" # Оставляем на случай, если понадобится в будущем
 
 
 # --- Функции API ---
@@ -37,6 +37,7 @@ async def get_insights_for_range(session: aiohttp.ClientSession, account_id: str
 # --- Функции обработки и анализа данных ---
 
 def process_insights_data(insights: list):
+    """ИЗМЕНЕНО: Убран подсчет кликов."""
     data = {}
     for campaign in insights:
         spend = float(campaign.get("spend", 0))
@@ -50,7 +51,6 @@ def process_insights_data(insights: list):
             "objective": campaign.get('objective', 'N/A'),
             "spend": spend,
             "leads": sum(int(a["value"]) for a in campaign.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE),
-            "clicks": sum(int(a["value"]) for a in campaign.get("actions", []) if a.get("action_type") == LINK_CLICK_ACTION_TYPE),
         }
     return data
 
@@ -67,67 +67,47 @@ def get_change_indicator(new, old, is_cost=False):
 # --- Функции форматирования отчета ---
 
 def format_summary(title: str, data_yesterday: dict, data_before_yesterday: dict):
+    """ИЗМЕНЕНО: Убрана информация о кликах и CPC."""
     y_spend = sum(c['spend'] for c in data_yesterday.values())
     y_leads = sum(c['leads'] for c in data_yesterday.values())
-    y_clicks = sum(c['clicks'] for c in data_yesterday.values())
     y_cpl = (y_spend / y_leads) if y_leads > 0 else 0
-    y_cpc = (y_spend / y_clicks) if y_clicks > 0 else 0
 
     by_spend = sum(c['spend'] for c in data_before_yesterday.values())
-    
-    spend_change = get_change_indicator(y_spend, by_spend)
-    
-    lines = [f"<b>{title}</b>", f"● Расход: ${y_spend:.2f} {spend_change}"]
-    if y_leads > 0:
-        by_leads = sum(c['leads'] for c in data_before_yesterday.values())
-        leads_change = get_change_indicator(y_leads, by_leads)
-        cpl_change = get_change_indicator(y_cpl, (by_spend / by_leads) if by_leads > 0 else 0, is_cost=True)
-        lines.append(f"● Лиды: {y_leads} {leads_change}")
-        lines.append(f"● Средний CPL: ${y_cpl:.2f} {cpl_change}")
-    if y_clicks > 0:
-        by_clicks = sum(c['clicks'] for c in data_before_yesterday.values())
-        clicks_change = get_change_indicator(y_clicks, by_clicks)
-        cpc_change = get_change_indicator(y_cpc, (by_spend / by_clicks) if by_clicks > 0 else 0, is_cost=True)
-        lines.append(f"● Клики: {y_clicks} {clicks_change}")
-        lines.append(f"● Средний CPC: ${y_cpc:.2f} {cpc_change}")
+    by_leads = sum(c['leads'] for c in data_before_yesterday.values())
+    by_cpl = (by_spend / by_leads) if by_leads > 0 else 0
 
+    spend_change = get_change_indicator(y_spend, by_spend)
+    leads_change = get_change_indicator(y_leads, by_leads)
+    cpl_change = get_change_indicator(y_cpl, by_cpl, is_cost=True)
+
+    lines = [
+        f"<b>{title}</b>",
+        f"● Расход: ${y_spend:.2f} {spend_change}",
+        f"● Лиды: {y_leads} {leads_change}",
+        f"● Средний CPL: ${y_cpl:.2f} {cpl_change}",
+    ]
     return "\n".join(lines)
 
 def format_key_campaigns(data_yesterday: dict):
-    """ИЗМЕНЕНО: Разделяет кампании по целям перед сравнением."""
-    lead_campaigns, traffic_campaigns = [], []
+    """ИЗМЕНЕНО: Сравнение теперь только по CPL."""
+    campaign_perf = []
     for camp_id, data in data_yesterday.items():
-        is_traffic = "TRAFFIC" in data['objective'].upper() or "LINK_CLICKS" in data['objective'].upper()
-        if is_traffic:
-            cost = (data['spend'] / data['clicks']) if data['clicks'] > 0 else float('inf')
-            if cost != float('inf'):
-                traffic_campaigns.append({"name": data['name'], "cost": cost, "metric": "CPC"})
-        else:
-            cost = (data['spend'] / data['leads']) if data['leads'] > 0 else float('inf')
-            if cost != float('inf'):
-                lead_campaigns.append({"name": data['name'], "cost": cost, "metric": "CPL"})
+        cost = (data['spend'] / data['leads']) if data['leads'] > 0 else float('inf')
+        if cost != float('inf'):
+            campaign_perf.append({"name": data['name'], "cost": cost})
 
-    lines = []
-    # Обработка кампаний на лиды/сообщения
-    if lead_campaigns:
-        sorted_leads = sorted(lead_campaigns, key=lambda x: x['cost'])
-        best = sorted_leads[0]
-        lines.append(f"🏆 Лучший CPL: \"{best['name']}\" (${best['cost']:.2f})")
-        if len(sorted_leads) > 1: # Показывать "худшую", только если их больше одной
-            worst = sorted_leads[-1]
-            lines.append(f"🐌 Худший CPL: \"{worst['name']}\" (${worst['cost']:.2f})")
+    if not campaign_perf: return ""
     
-    # Обработка кампаний на трафик
-    if traffic_campaigns:
-        sorted_traffic = sorted(traffic_campaigns, key=lambda x: x['cost'])
-        best = sorted_traffic[0]
-        lines.append(f"🏆 Лучший CPC: \"{best['name']}\" (${best['cost']:.2f})")
-        if len(sorted_traffic) > 1: # Показывать "худшую", только если их больше одной
-            worst = sorted_traffic[-1]
-            lines.append(f"🐌 Худший CPC: \"{worst['name']}\" (${worst['cost']:.2f})")
+    sorted_campaigns = sorted(campaign_perf, key=lambda x: x['cost'])
+    best = sorted_campaigns[0]
+
+    lines = ["<b>🔑 Ключевые кампании (по CPL):</b>"]
+    lines.append(f"🏆 Лучшая: \"{best['name']}\" (${best['cost']:.2f})")
+    if len(sorted_campaigns) > 1:
+        worst = sorted_campaigns[-1]
+        lines.append(f"🐌 Худшая: \"{worst['name']}\" (${worst['cost']:.2f})")
             
-    if not lines: return ""
-    return "<b>🔑 Ключевые кампании:</b>\n" + "\n".join(lines)
+    return "\n".join(lines)
 
 
 # --- Главные функции модуля ---
@@ -195,7 +175,6 @@ async def generate_daily_report_text() -> str:
     
     detailed_reports = [res['text'] for res in valid_results]
     
-    # ИЗМЕНЕНО: Добавлен заметный разделитель
     separator = "\n\n- - - - - - - - - -\n\n"
     final_report = header + "\n\n" + total_summary_block + separator + separator.join(detailed_reports)
     
