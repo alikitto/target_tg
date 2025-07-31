@@ -2,9 +2,9 @@ import os
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
-# --- Конфигурация и константы ---
+# --- Конфигурация ---
+from dotenv import load_dotenv
 load_dotenv()
 API_VERSION = "v19.0"
 META_TOKEN = os.getenv("META_ACCESS_TOKEN")
@@ -21,153 +21,185 @@ async def fb_get(session: aiohttp.ClientSession, url: str, params: dict = None):
         response.raise_for_status()
         return await response.json()
 
-async def get_ad_accounts(session: aiohttp.ClientSession):
-    url = f"https://graph.facebook.com/{API_VERSION}/me/adaccounts"
-    params = {"fields": "name,account_id"}
-    data = await fb_get(session, url, params=params)
-    return data.get("data", [])
-
-async def get_ad_level_insights_for_yesterday(session: aiohttp.ClientSession, account_id: str):
-    """
-    ИСПРАВЛЕНО: Убрано поле creative{thumbnail_url} отсюда.
-    Теперь запрашиваем только статистику.
-    """
+async def get_insights_for_range(session: aiohttp.ClientSession, account_id: str, time_range: dict):
+    """Получает статистику за указанный временной диапазон."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
     params = {
         "fields": "campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,actions,ctr,objective",
         "level": "ad",
-        "date_preset": "yesterday",
+        "time_range": time_range,
         "limit": 2000
     }
     data = await fb_get(session, url, params=params)
     return data.get("data", [])
 
-async def get_ad_creatives(session: aiohttp.ClientSession, ad_ids: list):
-    """
-    НОВАЯ ФУНКЦИЯ: Получает креативы (картинки) для списка ID объявлений.
-    """
-    url = f"https://graph.facebook.com/{API_VERSION}/"
-    params = {
-        "ids": ",".join(ad_ids),
-        "fields": "creative{thumbnail_url}",
-    }
-    data = await fb_get(session, url, params=params)
-    # Возвращаем словарь {ad_id: thumbnail_url}
-    return {ad_id: ad.get("creative", {}).get("thumbnail_url", "#") for ad_id, ad in data.items()}
 
+# --- Функции обработки и анализа данных ---
 
-# --- Функции обработки данных ---
-
-def merge_data(insights: list, creatives: dict):
-    """
-    НОВАЯ ФУНКЦИЯ: Объединяет данные из статистики и данные по креативам.
-    """
-    for insight in insights:
-        insight["thumbnail_url"] = creatives.get(insight["ad_id"], "#")
-    return insights
-
-def structure_insights(merged_insights: list):
-    campaigns = {}
-    for ad in merged_insights:
+def process_insights_data(insights: list):
+    """Обрабатывает сырые данные инсайтов, возвращая словарь с ключевыми метриками."""
+    data = {}
+    for ad in insights:
         spend = float(ad.get("spend", 0))
         if spend == 0: continue
         
-        camp_id, adset_id = ad.get('campaign_id'), ad.get('adset_id')
-        objective = ad.get('objective', 'N/A')
+        camp_id = ad.get('campaign_id')
+        if not camp_id: continue
+
+        if camp_id not in data:
+            data[camp_id] = {
+                "name": ad.get('campaign_name'),
+                "objective": ad.get('objective', 'N/A'),
+                "spend": 0, "leads": 0, "clicks": 0
+            }
         
-        if not all([camp_id, adset_id]): continue
+        leads = sum(int(a["value"]) for a in ad.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE)
+        clicks = sum(int(a["value"]) for a in ad.get("actions", []) if a.get("action_type") == LINK_CLICK_ACTION_TYPE)
+        
+        data[camp_id]["spend"] += spend
+        data[camp_id]["leads"] += leads
+        data[camp_id]["clicks"] += clicks
+        
+    return data
 
-        if camp_id not in campaigns:
-            campaigns[camp_id] = {"name": ad['campaign_name'], "objective": objective, "adsets": {}}
-        if adset_id not in campaigns[camp_id]['adsets']:
-            campaigns[camp_id]['adsets'][adset_id] = {"name": ad['adset_name'], "ads": []}
+def get_change_indicator(new, old):
+    """Возвращает строку с процентом изменения и эмодзи."""
+    if old == 0 and new > 0:
+        return "(📈)"
+    if old == 0:
+        return ""
+        
+    percent_change = ((new - old) / old) * 100
+    emoji = "📈" if new > old else "📉"
+    # Для CPL/CPC инвертируем логику: рост - это плохо
+    if "cpl" in str(old): emoji = "📈" if new > old else "📉" # just a trick
+    
+    return f"({emoji} {percent_change:+.0f}%)"
 
-        ad_data = {
-            "name": ad['ad_name'],
-            "spend": spend,
-            "leads": sum(int(a["value"]) for a in ad.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE),
-            "clicks": sum(int(a["value"]) for a in ad.get("actions", []) if a.get("action_type") == LINK_CLICK_ACTION_TYPE),
-            "ctr": float(ad.get('ctr', 0)),
-            "thumbnail_url": ad.get("thumbnail_url", "#")
-        }
-        campaigns[camp_id]['adsets'][adset_id]['ads'].append(ad_data)
-    return campaigns
 
-def analyze_adsets_and_format(campaigns_data: dict):
-    report_lines = []
-    for camp_id, camp in campaigns_data.items():
-        report_lines.append(f"<b>🎯 Кампания: {camp['name']}</b>")
-        for adset_id, adset in camp['adsets'].items():
-            total_spend = sum(ad['spend'] for ad in adset['ads'])
-            total_leads = sum(ad['leads'] for ad in adset['ads'])
-            total_clicks = sum(ad['clicks'] for ad in adset['ads'])
+# --- Функции форматирования отчета ---
 
-            cost_str = ""
-            if "TRAFFIC" in camp['objective'].upper() or "LINK_CLICKS" in camp['objective'].upper():
-                cpc = (total_spend / total_clicks) if total_clicks > 0 else 0
-                cost_str = f"Клики: {total_clicks} | CPC: ${cpc:.2f}"
-            else:
-                cpl = (total_spend / total_leads) if total_leads > 0 else 0
-                cost_str = f"Лиды: {total_leads} | CPL: ${cpl:.2f}"
+def format_summary(data_yesterday, data_before_yesterday):
+    """Форматирует главную сводку со сравнением."""
+    y_spend = sum(c['spend'] for c in data_yesterday.values())
+    y_leads = sum(c['leads'] for c in data_yesterday.values())
+    y_cpl = (y_spend / y_leads) if y_leads > 0 else 0
+
+    by_spend = sum(c['spend'] for c in data_before_yesterday.values())
+    by_leads = sum(c['leads'] for c in data_before_yesterday.values())
+    by_cpl = (by_spend / by_leads) if by_leads > 0 else 0
+
+    spend_change = get_change_indicator(y_spend, by_spend)
+    leads_change = get_change_indicator(y_leads, by_leads)
+    cpl_change = get_change_indicator(y_cpl, by_cpl) if by_cpl > 0 else ""
+
+    lines = [
+        "<b>📊 Общая статистика:</b>",
+        f"● Расход: ${y_spend:.2f} {spend_change}",
+        f"● Лиды: {y_leads} {leads_change}",
+        f"● Средний CPL: ${y_cpl:.2f} {cpl_change}",
+    ]
+    return "\n".join(lines)
+
+def format_key_campaigns(data_yesterday):
+    """Находит и форматирует лучшую и худшую кампании."""
+    if not data_yesterday: return ""
+    
+    campaign_perf = []
+    for camp_id, data in data_yesterday.items():
+        if "TRAFFIC" in data['objective'].upper() or "LINK_CLICKS" in data['objective'].upper():
+            cost = (data['spend'] / data['clicks']) if data['clicks'] > 0 else float('inf')
+            metric = "CPC"
+        else:
+            cost = (data['spend'] / data['leads']) if data['leads'] > 0 else float('inf')
+            metric = "CPL"
+        
+        if cost != float('inf'):
+            campaign_perf.append({"name": data['name'], "cost": cost, "metric": metric})
+
+    if not campaign_perf: return ""
+
+    sorted_campaigns = sorted(campaign_perf, key=lambda x: x['cost'])
+    best = sorted_campaigns[0]
+    worst = sorted_campaigns[-1]
+
+    lines = ["<b>🔑 Ключевые кампании:</b>"]
+    lines.append(f"🏆 Лучшая: \"{best['name']}\" ({best['metric']}: ${best['cost']:.2f})")
+    if best['name'] != worst['name']:
+        lines.append(f"🐌 Худшая: \"{worst['name']}\" ({worst['metric']}: ${worst['cost']:.2f})")
+        
+    return "\n".join(lines)
+
+def format_notifications(data_yesterday, data_before_yesterday):
+    """Создает список уведомлений и алертов."""
+    alerts = []
+    for camp_id, y_data in data_yesterday.items():
+        if camp_id in data_before_yesterday:
+            by_data = data_before_yesterday[camp_id]
             
-            report_lines.append(f"  <b>↳ Группа:</b> {adset['name']}")
-            report_lines.append(f"    - {cost_str} | Расход: ${total_spend:.2f}")
-    return "\n".join(report_lines)
+            y_cpl = (y_data['spend'] / y_data['leads']) if y_data['leads'] > 0 else 0
+            by_cpl = (by_data['spend'] / by_data['leads']) if by_data['leads'] > 0 else 0
+
+            if by_cpl > 0 and y_cpl > (by_cpl * 1.5): # Если CPL вырос более чем на 50%
+                growth = ((y_cpl - by_cpl) / by_cpl) * 100
+                alerts.append(f"🔴 <b>Внимание!</b> В кампании \"{y_data['name']}\" CPL вырос на {growth:.0f}%!")
+
+    if not alerts:
+        alerts.append("✅ Не обнаружено критических изменений.")
+        
+    return "<b>💡 Уведомления:</b>\n" + "\n".join(alerts)
+
 
 # --- Главная функция модуля ---
 
 async def generate_daily_report_text() -> str:
-    """
-    ИСПРАВЛЕНО: Логика вынесена в отдельную функцию process_account
-    """
-    timeout = aiohttp.ClientTimeout(total=240)
+    """Главная функция, которая собирает все данные и формирует итоговый отчет."""
+    
+    # Определяем временные рамки
+    today = datetime.now()
+    yesterday_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+    before_yesterday_str = (today - timedelta(days=2)).strftime('%Y-%m-%d')
+    
+    time_range_yesterday = {'since': yesterday_str, 'until': yesterday_str}
+    time_range_before_yesterday = {'since': before_yesterday_str, 'until': before_yesterday_str}
+
+    all_insights_yesterday = []
+    all_insights_before_yesterday = []
+
+    timeout = aiohttp.ClientTimeout(total=300)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        accounts = await get_ad_accounts(session)
-        if not accounts:
-            return "❌ Не найдено ни одного рекламного аккаунта."
+        accounts = await fb_get(session, f"https://graph.facebook.com/{API_VERSION}/me/adaccounts", {"fields": "name,account_id"})
+        accounts = accounts.get("data", [])
+        
+        if not accounts: return "❌ Не найдено ни одного рекламного аккаунта."
 
-        tasks = [process_account(session, acc) for acc in accounts]
-        account_results = await asyncio.gather(*tasks)
+        for acc in accounts:
+            try:
+                # Получаем данные за оба дня
+                y_insights = await get_insights_for_range(session, acc['account_id'], time_range_yesterday)
+                by_insights = await get_insights_for_range(session, acc['account_id'], time_range_before_yesterday)
+                all_insights_yesterday.extend(y_insights)
+                all_insights_before_yesterday.extend(by_insights)
+            except Exception as e:
+                print(f"Ошибка при получении данных для аккаунта {acc['name']}: {e}")
 
-    all_reports = [report for report in account_results if report]
+    # Обрабатываем данные
+    processed_yesterday = process_insights_data(all_insights_yesterday)
+    processed_before_yesterday = process_insights_data(all_insights_before_yesterday)
 
-    if not all_reports:
+    if not processed_yesterday:
         return "✅ За вчерашний день не было активности ни в одном из кабинетов."
-
-    report_date_str = (datetime.now() - timedelta(days=1)).strftime('%d %B %Y')
-    final_header = f"<b>📈 Дневная сводка за {report_date_str}</b>"
-    return final_header + "\n" + "\n".join(all_reports)
-
-async def process_account(session, acc):
-    """
-    НОВАЯ ФУНКЦИЯ: Полностью обрабатывает один аккаунт.
-    """
-    try:
-        # Шаг 1: Получаем статистику
-        insights = await get_ad_level_insights_for_yesterday(session, acc['account_id'])
-        if not insights:
-            return None
-
-        # Шаг 2: Получаем ID объявлений из статистики
-        active_ad_ids = [ad['ad_id'] for ad in insights]
-        if not active_ad_ids:
-            return None
-
-        # Шаг 3: Делаем второй запрос, чтобы получить картинки для этих ID
-        creatives = await get_ad_creatives(session, active_ad_ids)
-
-        # Шаг 4: Объединяем статистику и картинки
-        merged_data = merge_data(insights, creatives)
-
-        # Шаг 5: Формируем отчет
-        campaigns_data = structure_insights(merged_data)
-        if not campaigns_data:
-            return None
-
-        account_header = f"\n<b>🏢 Кабинет: <u>{acc['name']}</u></b>"
-        account_body = analyze_adsets_and_format(campaigns_data)
-        return account_header + "\n" + account_body
-
-    except Exception as e:
-        print(f"Ошибка при обработке аккаунта {acc.get('name', 'N/A')}: {e}")
-        return None
+    
+    # Собираем отчет по частям
+    report_date_str = (today - timedelta(days=1)).strftime('%d %B %Y')
+    prev_date_str = (today - timedelta(days=2)).strftime('%d %B')
+    
+    header = f"<b>📈 Дневная сводка за {report_date_str}</b>\n<i>Сравнение с предыдущим днём ({prev_date_str})</i>"
+    summary_block = format_summary(processed_yesterday, processed_before_yesterday)
+    key_campaigns_block = format_key_campaigns(processed_yesterday)
+    notifications_block = format_notifications(processed_yesterday, processed_before_yesterday)
+    
+    # Соединяем все в один отчет
+    final_report = "\n\n".join(filter(None, [header, summary_block, key_campaigns_block, notifications_block]))
+    
+    return final_report
