@@ -1,7 +1,7 @@
 import os
 import asyncio
 import requests
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -11,9 +11,12 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 META_TOKEN = os.getenv("META_ACCESS_TOKEN")
 
-bot = Bot(token=TELEGRAM_TOKEN)
+bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 router = Router()
+
+# === Храним отправленные сообщения бота для очистки ===
+sent_messages = []
 
 # ================= Graph API helpers =================
 def fb_get(url, params=None):
@@ -49,21 +52,80 @@ def get_adset_insights(account_id, adset_ids):
     }
     return fb_get(url, params).get("data", [])
 
-# ================= Progress bar =================
+# ================= Utils =================
 def progress_bar(current, total, length=20):
     filled = int(length * current // total)
     return "▓" * filled + "░" * (length - filled)
 
-# ================= Bot Handlers =================
+def cpl_label(cpl):
+    if cpl <= 1:
+        return "🟢 Дешёвый"
+    elif cpl <= 3:
+        return "🟡 Средний"
+    return "🔴 Дорогой"
+
+async def send_and_store(message, text, **kwargs):
+    msg = await message.answer(text, **kwargs)
+    sent_messages.append(msg.message_id)
+    return msg
+
+# ================= Меню =================
+def main_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Отчёт: Активные кампании", callback_data="build_report")
+    kb.button(text="Очистить чат", callback_data="clear_chat")
+    kb.button(text="Перезапустить бота", callback_data="restart_bot")
+    kb.button(text="Помощь", callback_data="help")
+    kb.button(text="Выход", callback_data="exit")
+    return kb.as_markup()
+
 @router.message(Command("start"))
 async def start_handler(msg: Message):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Собрать отчёт", callback_data="build_report")
-    await msg.answer("Привет! Нажми кнопку, чтобы собрать отчёт по активным кампаниям.", reply_markup=kb.as_markup())
+    await send_and_store(msg, "Привет! Это бот для анализа активных кампаний.\nВыберите действие:", reply_markup=main_menu())
 
-@router.callback_query(lambda c: c.data == "build_report")
+@router.callback_query(F.data == "help")
+async def help_callback(callback: CallbackQuery):
+    await send_and_store(callback.message,
+        "Бот собирает данные по активным кампаниям во всех ваших рекламных кабинетах "
+        "Meta и выводит их в удобном формате.\n\n"
+        "Кнопки меню:\n"
+        "• <b>Отчёт: Активные кампании</b> – показать активные кампании\n"
+        "• <b>Очистить чат</b> – удалить все сообщения бота\n"
+        "• <b>Перезапустить бота</b> – вернуться к стартовому меню\n"
+        "• <b>Выход</b> – закрыть меню"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "exit")
+async def exit_callback(callback: CallbackQuery):
+    await send_and_store(callback.message, "Меню закрыто. Для открытия введите /start")
+    await callback.answer()
+
+@router.callback_query(F.data == "restart_bot")
+async def restart_callback(callback: CallbackQuery):
+    global sent_messages
+    sent_messages = []
+    await send_and_store(callback.message, "Бот перезапущен! Выберите действие:", reply_markup=main_menu())
+    await callback.answer()
+
+@router.callback_query(F.data == "clear_chat")
+async def clear_chat(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    count = 0
+    for msg_id in sent_messages:
+        try:
+            await bot.delete_message(chat_id, msg_id)
+            count += 1
+        except:
+            pass
+    sent_messages.clear()
+    await send_and_store(callback.message, f"Чат очищен! Удалено сообщений: {count}", reply_markup=main_menu())
+    await callback.answer()
+
+# ================= Сбор отчёта =================
+@router.callback_query(F.data == "build_report")
 async def build_report(callback: CallbackQuery):
-    status_msg = await callback.message.answer("Начинаю сбор данных…")
+    status_msg = await send_and_store(callback.message, "Начинаю сбор данных…")
     await callback.answer()
 
     accounts = get_ad_accounts()
@@ -73,10 +135,7 @@ async def build_report(callback: CallbackQuery):
 
     active_accounts_data = []
 
-    for i, acc in enumerate(accounts, start=1):
-        bar = progress_bar(i, len(accounts))
-        await status_msg.edit_text(f"{bar}\nОбработка {i}/{len(accounts)}: {acc['name']}")
-
+    for acc in accounts:
         campaigns = get_campaigns(acc["account_id"])
         active_campaigns = {c["id"]: c for c in campaigns if c.get("status") == "ACTIVE"}
         adsets = get_all_adsets(acc["account_id"])
@@ -104,58 +163,56 @@ async def build_report(callback: CallbackQuery):
             if not campaign:
                 continue
 
-            cpl = (spend_map.get(ad["id"], 0) / chats_map.get(ad["id"], 1)) if chats_map.get(ad["id"], 0) > 0 else 0
+            spend = spend_map.get(ad["id"], 0)
+            leads = chats_map.get(ad["id"], 0)
+
+            # фильтр: нет трат и лидов → пропускаем
+            if spend == 0 and leads == 0:
+                continue
+
+            cpl = (spend / leads) if leads > 0 else 0
             ad_data = {
                 "name": ad["name"],
                 "objective": campaign.get("objective", ""),
                 "cpl": cpl,
-                "leads": chats_map.get(ad["id"], 0),
-                "spend": spend_map.get(ad["id"], 0),
+                "leads": leads,
+                "spend": spend,
             }
             if camp_id not in campaigns_data:
                 campaigns_data[camp_id] = {"name": campaign["name"], "adsets": []}
             campaigns_data[camp_id]["adsets"].append(ad_data)
 
-        active_accounts_data.append({
-            "name": acc["name"],
-            "campaigns": list(campaigns_data.values()),
-            "active_count": len(campaigns_data)
-        })
+        if campaigns_data:
+            active_accounts_data.append({
+                "name": acc["name"],
+                "campaigns": list(campaigns_data.values()),
+                "active_count": len(campaigns_data)
+            })
 
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
 
     if not active_accounts_data:
         await status_msg.edit_text("Активных кампаний не найдено.")
         return
 
-    await status_msg.edit_text("Отчёт большой, отправляю частями…")
+    await status_msg.edit_text("Отчёт большой, отправляю по кабинетам…")
 
     for acc in active_accounts_data:
         msg_lines = []
-        msg_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        msg_lines.append(f"🏢 Рекл. кабинет: {acc['name']}")
+        msg_lines.append(f"<b>Рекл. кабинет:</b> <u>{acc['name']}</u>")
         msg_lines.append(f"📈 Активных кампаний: {acc['active_count']}\n")
         for camp in acc["campaigns"]:
-            msg_lines.append(f"🎯 Кампания: {camp['name']}")
+            msg_lines.append(f"🎯 <b>{camp['name']}</b>")
             for ad in camp["adsets"]:
+                status_emoji = "🟢" if ad["leads"] > 0 else "🔴"
                 msg_lines.append(
-                    f"• Ad Set: {ad['name']}\n"
-                    f"   Цель: {ad['objective']} | CPL: ${ad['cpl']:.2f} | "
+                    f"{status_emoji} Ad Set: {ad['name']}\n"
+                    f"   Цель: {ad['objective']} | CPL: ${ad['cpl']:.2f} ({cpl_label(ad['cpl'])}) | "
                     f"Лиды: {ad['leads']} | Расход: ${ad['spend']:.2f}"
                 )
             msg_lines.append("")
-
         text = "\n".join(msg_lines)
-        try:
-            if len(text) > 3500:
-                chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)]
-                for chunk in chunks:
-                    await callback.message.answer(chunk)
-                    await asyncio.sleep(0.2)
-            else:
-                await callback.message.answer(text)
-        except Exception as e:
-            await callback.message.answer(f"Ошибка при отправке данных аккаунта {acc['name']}: {e}")
+        await send_and_store(callback.message, text)
 
     await status_msg.edit_text("Готово ✅")
 
