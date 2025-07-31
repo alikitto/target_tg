@@ -53,7 +53,6 @@ async def get_all_adsets(session: aiohttp.ClientSession, account_id: str):
     return data.get("data", [])
 
 async def get_adset_insights(session: aiohttp.ClientSession, account_id: str, adset_ids: list):
-    # ### ИЗМЕНЕНИЕ: Дата начала изменена на 1 июня.
     start_date = "2025-06-01"
     end_date = datetime.now().strftime("%Y-%m-%d")
     adset_ids_json_string = json.dumps(adset_ids)
@@ -212,7 +211,10 @@ async def build_report(event: Message | CallbackQuery):
                         if spend == 0 and leads == 0: continue
 
                         cpl = (spend / leads) if leads > 0 else 0
-                        ad_data = {"name": ad["name"], "objective": campaign.get("objective", "N/A"), "cpl": cpl, "leads": leads, "spend": spend}
+                        # ### ИЗМЕНЕНИЕ: Очищаем название цели для красивого вывода
+                        objective_clean = campaign.get("objective", "N/A").replace('OUTCOME_', '').replace('_', ' ').capitalize()
+                        ad_data = {"name": ad["name"], "objective": objective_clean, "cpl": cpl, "leads": leads, "spend": spend}
+                        
                         if camp_id not in campaigns_data:
                            campaigns_data[camp_id] = {"name": campaign["name"], "adsets": []}
                         campaigns_data[camp_id]["adsets"].append(ad_data)
@@ -249,14 +251,26 @@ async def build_report(event: Message | CallbackQuery):
     except TelegramBadRequest:
         pass
 
+    # ### ИЗМЕНЕНИЕ: Полностью переработанный блок форматирования вывода
     for acc in active_accounts_data:
-        msg_lines = [f"<b>🏢 Рекламный кабинет:</b> <u>{acc['name']}</u>", f"📈 Активных кампаний: {acc['active_count']}\n"]
+        msg_lines = [
+            f"<b>🏢 Рекламный кабинет:</b> <u>{acc['name']}</u>",
+            f"<b>📈 Активных кампаний:</b> {acc['active_count']}",
+            "─" * 20  # Визуальный разделитель
+        ]
+        
         for camp in acc["campaigns"]:
-            msg_lines.append(f"<b>🎯 {camp['name']}</b>")
+            msg_lines.append(f"\n<b>🎯 Кампания:</b> {camp['name']}")
             for ad in sorted(camp["adsets"], key=lambda x: x['cpl']):
-                status_emoji = "🟢" if ad["leads"] > 0 else "🔴"
-                msg_lines.append(f"{status_emoji} <b>{ad['name']}</b>\n  Цель: {ad['objective']} | CPL: <b>${ad['cpl']:.2f}</b> ({cpl_label(ad['cpl'])})\n  Лиды: {ad['leads']} | Расход: ${ad['spend']:.2f}")
-            msg_lines.append("")
+                adset_block = [
+                    f"  <b>↳ Группа:</b> <code>{ad['name']}</code>",
+                    f"    - <b>Цель:</b> {ad['objective']}",
+                    f"    - <b>Лиды:</b> {ad['leads']}",
+                    f"    - <b>Расход:</b> ${ad['spend']:.2f}",
+                    f"    - <b>CPL:</b> ${ad['cpl']:.2f} {cpl_label(ad['cpl'])}"
+                ]
+                msg_lines.extend(adset_block)
+        
         await send_and_store(message, "\n".join(msg_lines))
 
     await send_and_store(message, "✅ Отчёт завершён.", is_persistent=True, reply_markup=inline_main_menu())
