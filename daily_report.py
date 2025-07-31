@@ -16,19 +16,28 @@ async def fb_get(session: aiohttp.ClientSession, url: str, params: dict = None, 
         response.raise_for_status()
         return await response.json()
 
+# НОВАЯ функция для получения целей кампаний
+async def get_campaign_objectives(session: aiohttp.ClientSession, account_id: str, access_token: str):
+    """Получает словарь {id_кампании: цель_кампании}."""
+    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/campaigns"
+    params = {"fields": "id,objective", "limit": 1000}
+    data = await fb_get(session, url, params=params, access_token=access_token)
+    return {campaign['id']: campaign.get('objective', 'N/A') for campaign in data.get("data", [])}
+
+# ИСПРАВЛЕННАЯ функция получения инсайтов (удалено поле objective)
 async def get_ad_level_insights_for_date(session: aiohttp.ClientSession, account_id: str, date_str: str, access_token: str):
     """Получает детализированную статистику на уровне объявлений за конкретную дату."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
     params = {
-        "fields": "campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,actions,ctr,objective,creative{thumbnail_url}",
+        "fields": "campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,actions,ctr,creative{thumbnail_url}",
         "level": "ad",
         "time_range": json.dumps({"since": date_str, "until": date_str}),
-        "limit": 1000  # Увеличиваем лимит на случай большого кол-ва объявлений
+        "limit": 1000
     }
     data = await fb_get(session, url, params=params, access_token=access_token)
     return data.get("data", [])
 
-def structure_insights(insights: list):
+def structure_insights(insights: list, objectives: dict):
     """Структурирует плоский список инсайтов в иерархию Кампания -> Группа -> Объявления."""
     campaigns = {}
     for ad in insights:
@@ -38,11 +47,15 @@ def structure_insights(insights: list):
 
         camp_id = ad['campaign_id']
         adset_id = ad['adset_id']
+        
+        # Пропускаем, если по какой-то причине нет цели для кампании
+        if camp_id not in objectives:
+            continue
 
         if camp_id not in campaigns:
             campaigns[camp_id] = {
                 "name": ad['campaign_name'],
-                "objective": ad.get('objective', 'N/A'),
+                "objective": objectives[camp_id], # Берем цель из нового словаря
                 "adsets": {}
             }
 
@@ -117,19 +130,17 @@ async def generate_daily_report_text(accounts: list, meta_token: str):
 
     final_report_lines = [f"<b>📈 Дневная сводка за {report_date_str}</b>"]
     
-    timeout = aiohttp.ClientTimeout(total=240) # Увеличим таймаут, т.к. запросы стали тяжелее
+    timeout = aiohttp.ClientTimeout(total=240)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [process_single_account(session, acc, yesterday_str, meta_token) for acc in accounts]
         account_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     active_reports = 0
     for result in account_results:
-        if isinstance(result, Exception):
-            # Можно добавить логирование ошибок, если нужно
+        if isinstance(result, Exception) or not result:
             continue
-        if result:
-            final_report_lines.append(result)
-            active_reports += 1
+        final_report_lines.append(result)
+        active_reports += 1
             
     if active_reports == 0:
         return "✅ За вчерашний день не было активности ни в одном из кабинетов."
@@ -138,11 +149,18 @@ async def generate_daily_report_text(accounts: list, meta_token: str):
 
 async def process_single_account(session, acc, date_str, meta_token):
     """Обрабатывает один рекламный аккаунт и возвращает готовую текстовую секцию отчета."""
+    # Шаг 1: Получаем цели кампаний
+    objectives = await get_campaign_objectives(session, acc["account_id"], meta_token)
+    if not objectives:
+        return None # Нет кампаний в аккаунте
+
+    # Шаг 2: Получаем статистику по объявлениям
     insights = await get_ad_level_insights_for_date(session, acc["account_id"], date_str, meta_token)
     if not insights:
         return None
 
-    campaigns_data = structure_insights(insights)
+    # Шаг 3: Структурируем данные
+    campaigns_data = structure_insights(insights, objectives)
     if not campaigns_data:
         return None
         
@@ -156,7 +174,6 @@ async def process_single_account(session, acc, date_str, meta_token):
     # --- Формируем текст ---
     report_lines = ["─" * 20, f"<b>🏢 Кабинет: <u>{acc['name']}</u></b>"]
     
-    # Общая статистика по кабинету
     cost_str = ""
     if total_leads > 0:
         cpl = total_spend / total_leads
@@ -174,7 +191,7 @@ async def process_single_account(session, acc, date_str, meta_token):
     adsets_with_cost = sorted([a for a in adsets if a['cost'] != float('inf')], key=lambda x: x['cost'])
     
     if not adsets_with_cost:
-        return "\n".join(report_lines) # Возвращаем только общую стату, если нет данных для анализа
+        return "\n".join(report_lines)
 
     best_adset = adsets_with_cost[0]
     worst_adset = adsets_with_cost[-1] if len(adsets_with_cost) > 1 else None
