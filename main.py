@@ -42,40 +42,22 @@ async def get_ad_accounts(session: aiohttp.ClientSession):
 
 async def get_campaigns(session: aiohttp.ClientSession, account_id: str):
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/campaigns"
-    params = {"fields": "id,name,status,objective", "limit": 500}
+    params = {"fields": "id,name,objective", "limit": 500}
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-# ### ИЗМЕНЕНИЕ: Умная функция, которая находит только РЕАЛЬНО РАБОТАЮЩИЕ группы
-async def get_delivering_adsets(session: aiohttp.ClientSession, account_id: str, start_date: str, end_date: str):
-    """Находит ID и данные только тех групп, у которых были траты в заданный период."""
+# ### ИЗМЕНЕНИЕ: Единственная функция для получения статистики, как в Apps Script
+async def get_adset_level_insights(session: aiohttp.ClientSession, account_id: str, start_date: str, end_date: str):
+    """Получает статистику на уровне ГРУПП ОБЪЯВЛЕНИЙ для всех работающих групп."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
+    # Фильтр по реально работающим группам (у которых есть показы)
+    filtering = f'[{{"field":"adset.effective_status","operator":"IN","value":["ACTIVE"]}}]'
     params = {
-        "fields": "adset_id,adset_name,campaign_id",
+        "fields": "campaign_id,adset_id,adset_name,spend,actions,link_clicks,ctr",
         "level": "adset",
-        "filtering": f'[{{"field":"spend","operator":"GREATER_THAN","value":0}}]',
+        "filtering": filtering,
         "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
         "limit": 500
-    }
-    data = await fb_get(session, url, params)
-    return data.get("data", [])
-
-async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id: str, delivering_adset_ids: list):
-    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/ads"
-    filtering = [{'field': 'adset.id', 'operator': 'IN', 'value': delivering_adset_ids}, {'field': 'effective_status', 'operator': 'IN', 'value': ['ACTIVE']}]
-    params = {"fields": "id,name,adset_id,campaign_id,creative{thumbnail_url}", "filtering": json.dumps(filtering), "limit": 1000}
-    data = await fb_get(session, url, params)
-    return data.get("data", [])
-
-async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str, ad_ids: list, start_date: str, end_date: str):
-    ad_ids_json_string = json.dumps(ad_ids)
-    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
-    params = {
-        "fields": "ad_id,spend,actions,ctr,link_clicks",
-        "level": "ad",
-        "filtering": f'[{{"field":"ad.id","operator":"IN","value":{ad_ids_json_string}}}]',
-        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
-        "limit": 1000
     }
     data = await fb_get(session, url, params)
     return data.get("data", [])
@@ -192,51 +174,37 @@ async def build_report(call: CallbackQuery):
                 base_text = f"📦({idx}/{total}) Кабинет: <b>{acc['name']}</b>\n"
                 
                 try:
-                    await status_msg.edit_text(base_text + " Поиск работающих кампаний...")
+                    await status_msg.edit_text(base_text + " Поиск и анализ кампаний...")
                     campaigns = await get_campaigns(session, acc["account_id"])
                     campaigns_map = {c['id']: c for c in campaigns}
                     
-                    # ### ИЗМЕНЕНИЕ: Сразу получаем только РАБОТАЮЩИЕ группы
-                    delivering_adsets = await get_delivering_adsets(session, acc["account_id"], start_date, end_date)
-                    if not delivering_adsets:
-                        continue # Если нет групп с тратами, сразу переходим к след. кабинету
+                    # ### ИЗМЕНЕНИЕ: Один быстрый запрос для получения всей статистики
+                    insights = await get_adset_level_insights(session, acc["account_id"], start_date, end_date)
+                    if not insights:
+                        continue
                     
-                    adsets_map = {a['adset_id']: a for a in delivering_adsets}
-                    delivering_adset_ids = list(adsets_map.keys())
-
-                    await status_msg.edit_text(base_text + " Cкачиваю объявления...")
-                    ads = await get_all_ads_with_creatives(session, acc["account_id"], delivering_adset_ids)
-                    if not ads: continue
-                    
-                    ad_ids = [ad['id'] for ad in ads]
-                    
-                    await status_msg.edit_text(base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
-                    insights = await get_ad_level_insights(session, acc["account_id"], ad_ids, start_date, end_date)
-                    
-                    insights_map = {}
-                    for row in insights:
-                        ad_id = row['ad_id']
-                        spend = float(row.get("spend", 0))
-                        if spend == 0: continue
-                        
-                        insights_map[ad_id] = {"spend": spend, "leads": sum(int(a["value"]) for a in row.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE), "clicks": int(row.get("link_clicks", 0)), "ctr": float(row.get("ctr", 0))}
-
                     account_data = {}
-                    for ad in ads:
-                        ad_id, adset_id, campaign_id = ad['id'], ad['adset_id'], ad.get('campaign_id')
-                        if ad_id not in insights_map or adset_id not in adsets_map or campaign_id not in campaigns_map: continue
+                    for adset_insight in insights:
+                        spend = float(adset_insight.get("spend", 0))
+                        if spend == 0: continue
+
+                        campaign_id = adset_insight.get('campaign_id')
+                        adset_id = adset_insight.get('adset_id')
                         
-                        stats = insights_map[ad_id]
+                        if campaign_id not in campaigns_map: continue
                         
                         if campaign_id not in account_data:
                             campaign_obj = campaigns_map[campaign_id]
-                            account_data[campaign_id] = {"name": campaign_obj['name'], "objective_raw": campaign_obj.get("objective", "N/A"), "adsets": {}}
+                            account_data[campaign_id] = {"name": campaign_obj['name'], "objective_raw": campaign_obj.get("objective", "N/A"), "adsets": []}
                         
-                        if adset_id not in account_data[campaign_id]['adsets']:
-                            account_data[campaign_id]['adsets'][adset_id] = {"name": adsets_map[adset_id]['adset_name'], "ads": []}
-                        
-                        ad_info = {"name": ad['name'], "thumbnail_url": ad.get('creative', {}).get('thumbnail_url'), **stats}
-                        account_data[campaign_id]['adsets'][adset_id]['ads'].append(ad_info)
+                        adset_info = {
+                            "name": adset_insight.get('adset_name'),
+                            "spend": spend,
+                            "leads": sum(int(a["value"]) for a in adset_insight.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE),
+                            "clicks": int(adset_insight.get("link_clicks", 0)),
+                            "ctr": float(adset_insight.get("ctr", 0))
+                        }
+                        account_data[campaign_id]['adsets'].append(adset_info)
 
                     if account_data: all_accounts_data[acc['name']] = account_data
                 except asyncio.TimeoutError:
@@ -270,30 +238,23 @@ async def build_report(call: CallbackQuery):
             objective_clean = camp_data['objective_raw'].replace('OUTCOME_', '').replace('_', ' ').capitalize()
             msg_lines.append(f"\n<b>🎯 Кампания:</b> {camp_data['name']}")
             
-            for adset_id, adset_data in camp_data['adsets'].items():
-                total_spend = sum(ad['spend'] for ad in adset_data['ads'])
+            for adset in sorted(camp_data['adsets'], key=lambda x: x['spend'], reverse=True):
                 if is_traffic:
-                    total_metric_val = sum(ad['clicks'] for ad in adset_data['ads'])
-                    total_cost_per_action = (total_spend / total_metric_val) if total_metric_val > 0 else 0
+                    metric_val = adset['clicks']
+                    cost_per_action = (adset['spend'] / metric_val) if metric_val > 0 else 0
                     metric_name, cost_name = "Клики", "CPC"
                 else:
-                    total_metric_val = sum(ad['leads'] for ad in adset_data['ads'])
-                    total_cost_per_action = (total_spend / total_metric_val) if total_metric_val > 0 else 0
+                    metric_val = adset['leads']
+                    cost_per_action = (adset['spend'] / metric_val) if metric_val > 0 else 0
                     metric_name, cost_name = "Лиды", "CPL"
 
-                msg_lines.extend([f"  <b>↳ Группа:</b> <code>{adset_data['name']}</code>", f"    - <b>Цель:</b> {objective_clean}", f"    - <b>{metric_name}:</b> {total_metric_val}", f"    - <b>Расход:</b> ${total_spend:.2f}", f"    - <b>{cost_name}:</b> ${total_cost_per_action:.2f} {metric_label(total_cost_per_action)}"])
-                
-                if adset_data['ads']:
-                    msg_lines.append("  <b>↳ Объявления:</b>")
-                    for ad in sorted(adset_data['ads'], key=lambda x: x['spend'], reverse=True):
-                        thumb_url = ad.get('thumbnail_url', '#')
-                        if is_traffic:
-                            ad_cost_per_action = (ad['spend'] / ad['clicks']) if ad['clicks'] > 0 else 0
-                            ad_cost_name = "CPC"
-                        else:
-                            ad_cost_per_action = (ad['spend'] / ad['leads']) if ad['leads'] > 0 else 0
-                            ad_cost_name = "CPL"
-                        msg_lines.append(f'    <a href="{thumb_url}">🖼️</a> <b>{ad["name"]}</b> | {ad_cost_name}: ${ad_cost_per_action:.2f} | CTR: {ad["ctr"]:.2f}%')
+                msg_lines.extend([
+                    f"  <b>↳ Группа:</b> <code>{adset['name']}</code>",
+                    f"    - <b>Цель:</b> {objective_clean}",
+                    f"    - <b>{metric_name}:</b> {metric_val}",
+                    f"    - <b>Расход:</b> ${adset['spend']:.2f}",
+                    f"    - <b>{cost_name}:</b> ${cost_per_action:.2f} {metric_label(cost_per_action)}"
+                ])
         
         await send_and_store(message, "\n".join(msg_lines))
 
