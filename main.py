@@ -110,7 +110,6 @@ async def update_panel(chat_id: int, text: str, **kwargs):
             msg = await bot.send_message(chat_id, text, **kwargs)
             session["panel_id"] = msg.message_id
         else:
-            # Игнорируем другие ошибки, чтобы бот не падал
             print(f"Error updating panel: {e}")
 
 
@@ -124,7 +123,7 @@ async def set_bot_commands(bot: Bot):
 def inline_main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Отчёт: Активные кампании", callback_data="select_report_period")
-    kb.button(text="🧹 Очистить отчёты", callback_data="clear_chat")
+    kb.button(text="� Очистить отчёты", callback_data="clear_chat")
     return kb.as_markup()
 
 def inline_period_menu():
@@ -226,15 +225,8 @@ async def build_report(call: CallbackQuery):
                     
                     ad_ids = [ad['id'] for ad in ads]
                     
-                    # ### ИЗМЕНЕНИЕ: Запрос статистики небольшими порциями (батчами)
-                    insights = []
-                    batch_size = 40 # Безопасный размер порции
-                    for i in range(0, len(ad_ids), batch_size):
-                        batch_ad_ids = ad_ids[i:i + batch_size]
-                        progress_text = f" Cкачиваю статистику ({i + len(batch_ad_ids)}/{len(ad_ids)})..."
-                        await update_panel(chat_id, base_text + progress_text)
-                        insights_batch = await get_ad_level_insights(session, acc["account_id"], batch_ad_ids, start_date, end_date)
-                        insights.extend(insights_batch)
+                    await update_panel(chat_id, base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
+                    insights = await get_ad_level_insights(session, acc["account_id"], ad_ids, start_date, end_date)
                     
                     insights_map = {}
                     for row in insights:
@@ -332,3 +324,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Бот остановлен вручную.")
+�
