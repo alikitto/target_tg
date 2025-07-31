@@ -196,18 +196,24 @@ async def help_handler(message: Message):
 
 @router.message(F.text == "📈 Дневной отчёт")
 async def daily_report_handler(message: Message):
-    """
-    Запускает формирование дневного отчета из файла daily_report.py
-    """
     status_msg = await message.answer("⏳ Собираю дневную сводку, это может занять до минуты...")
     try:
-        # Эта функция должна быть в вашем файле daily_report.py
-        report_text = await generate_daily_report_text()
+        # 1. Открываем сессию для запросов к API
+        async with aiohttp.ClientSession() as session:
+            # 2. Получаем список аккаунтов
+            accounts = await get_ad_accounts(session)
+
+        if not accounts:
+            await status_msg.edit_text("❌ Не найдено ни одного рекламного аккаунта.")
+            return
+
+        # 3. Вызываем функцию, ПЕРЕДАВАЯ ей аккаунты и токен
+        report_text = await generate_daily_report_text(accounts, META_TOKEN)
 
         # Удаляем сообщение "Собираю..."
         await bot.delete_message(message.chat.id, status_msg.message_id)
 
-        # Разбиваем на части, если отчёт слишком длинный
+        # Отправляем готовый отчет
         if len(report_text) > 4096:
             for x in range(0, len(report_text), 4096):
                 await message.answer(report_text[x:x+4096])
@@ -215,8 +221,9 @@ async def daily_report_handler(message: Message):
             await message.answer(report_text)
 
     except Exception as e:
+        # Выводим ошибку в консоль для отладки
+        print(f"Произошла ошибка: {e}")
         await status_msg.edit_text(f"❌ Произошла ошибка при создании дневного отчёта:\n`{type(e).__name__}: {e}`")
-
 
 @router.message(Command("clear"))
 async def clear_chat_command_handler(message: Message):
