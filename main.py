@@ -58,7 +58,7 @@ def get_ad_creatives(adset_id):
         thumb = ad.get("creative", {}).get("thumbnail_url")
         if thumb:
             thumbs.append(thumb)
-    return thumbs
+    return thumbs[:3]  # ограничиваем до 3
 
 # ================= Progress bar =================
 def progress_bar(current, total, length=20):
@@ -84,7 +84,6 @@ async def build_report(callback: CallbackQuery):
 
     active_accounts_data = []
 
-    # ===== Обработка каждого аккаунта =====
     for i, acc in enumerate(accounts, start=1):
         bar = progress_bar(i, len(accounts))
         await status_msg.edit_text(f"{bar}\nОбработка {i}/{len(accounts)}: {acc['name']}")
@@ -95,9 +94,8 @@ async def build_report(callback: CallbackQuery):
         active_adsets = [a for a in adsets if a.get("status") == "ACTIVE" and a.get("campaign_id") in active_campaigns]
 
         if not active_adsets:
-            continue  # Пропускаем аккаунт без активных кампаний
+            continue
 
-        # Получаем инсайты
         adset_ids = [a["id"] for a in active_adsets]
         insights = get_adset_insights(acc["account_id"], adset_ids)
 
@@ -113,7 +111,6 @@ async def build_report(callback: CallbackQuery):
             spend_map[adset_id] = spend
             chats_map[adset_id] = chats
 
-        # Группируем по кампаниям
         campaigns_data = {}
         for ad in active_adsets:
             camp_id = ad["campaign_id"]
@@ -142,30 +139,32 @@ async def build_report(callback: CallbackQuery):
 
         await asyncio.sleep(0.5)
 
-    # ===== Формируем красивый отчёт =====
     if not active_accounts_data:
         await status_msg.edit_text("Активных кампаний не найдено.")
         return
 
-    output = [f"📊 Активных рекламных кабинетов: {len(active_accounts_data)}"]
+    await status_msg.edit_text("Отчёт большой, отправляю частями…")
+
+    # === Отправляем каждый кабинет отдельно ===
     for acc in active_accounts_data:
-        output.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        output.append(f"🏢 Рекл. кабинет: {acc['name']}")
-        output.append(f"📈 Активных кампаний: {acc['active_count']}\n")
+        msg_lines = []
+        msg_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        msg_lines.append(f"🏢 Рекл. кабинет: {acc['name']}")
+        msg_lines.append(f"📈 Активных кампаний: {acc['active_count']}\n")
         for camp in acc["campaigns"]:
-            output.append(f"🎯 Кампания: {camp['name']}")
+            msg_lines.append(f"🎯 Кампания: {camp['name']}")
             for ad in camp["adsets"]:
-                output.append(
+                msg_lines.append(
                     f"• Ad Set: {ad['name']}\n"
                     f"   Цель: {ad['objective']} | CPL: ${ad['cpl']:.2f} | "
                     f"Лиды: {ad['leads']} | Расход: ${ad['spend']:.2f}"
                 )
                 if ad["thumbs"]:
-                    output.append("   Миниатюры:\n   " + "\n   ".join(ad["thumbs"]))
-            output.append("")  # Пустая строка для читаемости
+                    msg_lines.append("   Миниатюры:\n   " + "\n   ".join(ad["thumbs"]))
+            msg_lines.append("")  # пустая строка
+        await callback.message.answer("\n".join(msg_lines))
+        await asyncio.sleep(0.3)
 
-    await status_msg.edit_text("Отчёт готов. Отправляю данные…")
-    await callback.message.answer("\n".join(output))
     await status_msg.edit_text("Готово ✅")
 
 # ================= Run =================
