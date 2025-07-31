@@ -26,7 +26,7 @@ async def get_insights_for_range(session: aiohttp.ClientSession, account_id: str
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
     params = {
         "fields": "campaign_id,campaign_name,spend,actions,objective",
-        "level": "campaign", # Собираем данные на уровне кампаний для анализа
+        "level": "campaign",
         "time_range": json.dumps(time_range),
         "limit": 500
     }
@@ -59,7 +59,7 @@ def get_change_indicator(new, old, is_cost=False):
         return "(новая)" if new > 0 else ""
     percent_change = ((new - old) / old) * 100
     emoji = "📈" if new > old else "📉"
-    if is_cost: # Для CPL/CPC инвертируем логику
+    if is_cost:
         emoji = "📈" if new > old else "📉"
     return f"({emoji} {percent_change:+.0f}%)"
 
@@ -67,78 +67,87 @@ def get_change_indicator(new, old, is_cost=False):
 # --- Функции форматирования отчета ---
 
 def format_summary(title: str, data_yesterday: dict, data_before_yesterday: dict):
-    """Форматирует блок сводки (как общую, так и для одного кабинета)."""
     y_spend = sum(c['spend'] for c in data_yesterday.values())
     y_leads = sum(c['leads'] for c in data_yesterday.values())
+    y_clicks = sum(c['clicks'] for c in data_yesterday.values())
     y_cpl = (y_spend / y_leads) if y_leads > 0 else 0
+    y_cpc = (y_spend / y_clicks) if y_clicks > 0 else 0
 
     by_spend = sum(c['spend'] for c in data_before_yesterday.values())
-    by_leads = sum(c['leads'] for c in data_before_yesterday.values())
-    by_cpl = (by_spend / by_leads) if by_leads > 0 else 0
-
+    
     spend_change = get_change_indicator(y_spend, by_spend)
-    leads_change = get_change_indicator(y_leads, by_leads)
-    cpl_change = get_change_indicator(y_cpl, by_cpl, is_cost=True)
+    
+    lines = [f"<b>{title}</b>", f"● Расход: ${y_spend:.2f} {spend_change}"]
+    if y_leads > 0:
+        by_leads = sum(c['leads'] for c in data_before_yesterday.values())
+        leads_change = get_change_indicator(y_leads, by_leads)
+        cpl_change = get_change_indicator(y_cpl, (by_spend / by_leads) if by_leads > 0 else 0, is_cost=True)
+        lines.append(f"● Лиды: {y_leads} {leads_change}")
+        lines.append(f"● Средний CPL: ${y_cpl:.2f} {cpl_change}")
+    if y_clicks > 0:
+        by_clicks = sum(c['clicks'] for c in data_before_yesterday.values())
+        clicks_change = get_change_indicator(y_clicks, by_clicks)
+        cpc_change = get_change_indicator(y_cpc, (by_spend / by_clicks) if by_clicks > 0 else 0, is_cost=True)
+        lines.append(f"● Клики: {y_clicks} {clicks_change}")
+        lines.append(f"● Средний CPC: ${y_cpc:.2f} {cpc_change}")
 
-    lines = [
-        f"<b>{title}</b>",
-        f"● Расход: ${y_spend:.2f} {spend_change}",
-        f"● Лиды: {y_leads} {leads_change}",
-        f"● Средний CPL: ${y_cpl:.2f} {cpl_change}",
-    ]
     return "\n".join(lines)
 
 def format_key_campaigns(data_yesterday: dict):
-    """Находит и форматирует лучшую и худшую кампании."""
-    campaign_perf = []
+    """ИЗМЕНЕНО: Разделяет кампании по целям перед сравнением."""
+    lead_campaigns, traffic_campaigns = [], []
     for camp_id, data in data_yesterday.items():
         is_traffic = "TRAFFIC" in data['objective'].upper() or "LINK_CLICKS" in data['objective'].upper()
-        cost = float('inf')
-        metric = "CPL"
         if is_traffic:
-            metric = "CPC"
-            if data['clicks'] > 0: cost = data['spend'] / data['clicks']
-        elif data['leads'] > 0:
-            cost = data['spend'] / data['leads']
-        
-        if cost != float('inf'):
-            campaign_perf.append({"name": data['name'], "cost": cost, "metric": metric})
+            cost = (data['spend'] / data['clicks']) if data['clicks'] > 0 else float('inf')
+            if cost != float('inf'):
+                traffic_campaigns.append({"name": data['name'], "cost": cost, "metric": "CPC"})
+        else:
+            cost = (data['spend'] / data['leads']) if data['leads'] > 0 else float('inf')
+            if cost != float('inf'):
+                lead_campaigns.append({"name": data['name'], "cost": cost, "metric": "CPL"})
 
-    if not campaign_perf: return ""
+    lines = []
+    # Обработка кампаний на лиды/сообщения
+    if lead_campaigns:
+        sorted_leads = sorted(lead_campaigns, key=lambda x: x['cost'])
+        best = sorted_leads[0]
+        lines.append(f"🏆 Лучший CPL: \"{best['name']}\" (${best['cost']:.2f})")
+        if len(sorted_leads) > 1: # Показывать "худшую", только если их больше одной
+            worst = sorted_leads[-1]
+            lines.append(f"🐌 Худший CPL: \"{worst['name']}\" (${worst['cost']:.2f})")
     
-    sorted_campaigns = sorted(campaign_perf, key=lambda x: x['cost'])
-    best = sorted_campaigns[0]
-    worst = sorted_campaigns[-1]
-
-    lines = ["<b>🔑 Ключевые кампании:</b>"]
-    lines.append(f"🏆 Лучшая: \"{best['name']}\" ({best['metric']}: ${best['cost']:.2f})")
-    if best['name'] != worst['name'] and len(sorted_campaigns) > 1:
-        lines.append(f"🐌 Худшая: \"{worst['name']}\" ({worst['metric']}: ${worst['cost']:.2f})")
-    return "\n".join(lines)
+    # Обработка кампаний на трафик
+    if traffic_campaigns:
+        sorted_traffic = sorted(traffic_campaigns, key=lambda x: x['cost'])
+        best = sorted_traffic[0]
+        lines.append(f"🏆 Лучший CPC: \"{best['name']}\" (${best['cost']:.2f})")
+        if len(sorted_traffic) > 1: # Показывать "худшую", только если их больше одной
+            worst = sorted_traffic[-1]
+            lines.append(f"🐌 Худший CPC: \"{worst['name']}\" (${worst['cost']:.2f})")
+            
+    if not lines: return ""
+    return "<b>🔑 Ключевые кампании:</b>\n" + "\n".join(lines)
 
 
 # --- Главные функции модуля ---
 
 async def process_single_account(session: aiohttp.ClientSession, acc: dict, time_yesterday: dict, time_before_yesterday: dict):
-    """Новая функция: Собирает, анализирует и форматирует отчет для ОДНОГО аккаунта."""
     try:
         insights_yesterday = await get_insights_for_range(session, acc['account_id'], time_yesterday)
         insights_before_yesterday = await get_insights_for_range(session, acc['account_id'], time_before_yesterday)
 
         processed_yesterday = process_insights_data(insights_yesterday)
-        if not processed_yesterday:
-            return None # Если не было активности, пропускаем аккаунт
+        if not processed_yesterday: return None
 
         processed_before_yesterday = process_insights_data(insights_before_yesterday)
         
-        # Собираем текстовый блок для этого аккаунта
         summary_title = f"🏢 Кабинет: <u>{acc['name']}</u>"
         summary_block = format_summary(summary_title, processed_yesterday, processed_before_yesterday)
         key_campaigns_block = format_key_campaigns(processed_yesterday)
 
         report_text = "\n\n".join(filter(None, [summary_block, key_campaigns_block]))
         
-        # Возвращаем и текст, и данные для общей сводки
         return {
             "text": report_text,
             "data_y": processed_yesterday,
@@ -149,7 +158,6 @@ async def process_single_account(session: aiohttp.ClientSession, acc: dict, time
         return None
 
 async def generate_daily_report_text() -> str:
-    """Главная функция, которая формирует итоговый отчет."""
     today = datetime.now()
     yesterday_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
     before_yesterday_str = (today - timedelta(days=2)).strftime('%Y-%m-%d')
@@ -168,22 +176,18 @@ async def generate_daily_report_text() -> str:
         results = await asyncio.gather(*tasks)
 
     valid_results = [res for res in results if res]
-
     if not valid_results:
         return "✅ За вчерашний день не было активности ни в одном из кабинетов."
     
-    # --- Формирование общей сводки ---
-    total_y_data = {}
-    total_by_data = {}
+    total_y_data, total_by_data = {}, {}
     for res in valid_results:
         for camp_id, data in res['data_y'].items():
-            total_y_data[f"{res['text']}_{camp_id}"] = data # Используем уникальные ключи
+            total_y_data[f"{res['text']}_{camp_id}"] = data
         for camp_id, data in res['data_by'].items():
             total_by_data[f"{res['text']}_{camp_id}"] = data
             
     total_summary_block = format_summary("📊 Общая сводка по всем кабинетам", total_y_data, total_by_data)
     
-    # --- Сборка финального отчета ---
     report_date_str = (today - timedelta(days=1)).strftime('%d %B %Y')
     prev_date_str = (today - timedelta(days=2)).strftime('%d %B')
     
@@ -191,7 +195,8 @@ async def generate_daily_report_text() -> str:
     
     detailed_reports = [res['text'] for res in valid_results]
     
-    # Соединяем все в один отчет: общая сводка, а затем детальные отчеты
-    final_report = header + "\n\n" + total_summary_block + "\n" + "\n---\n".join(detailed_reports)
+    # ИЗМЕНЕНО: Добавлен заметный разделитель
+    separator = "\n\n- - - - - - - - - -\n\n"
+    final_report = header + "\n\n" + total_summary_block + separator + separator.join(detailed_reports)
     
     return final_report
