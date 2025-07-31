@@ -5,12 +5,11 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # --- Конфигурация и константы ---
-load_dotenv() # Этот модуль сам загружает переменные из .env
+load_dotenv()
 API_VERSION = "v19.0"
-META_TOKEN = os.getenv("META_ACCESS_TOKEN") # И сам получает токен
+META_TOKEN = os.getenv("META_ACCESS_TOKEN")
 LEAD_ACTION_TYPE = "onsite_conversion.messaging_conversation_started_7d"
 LINK_CLICK_ACTION_TYPE = "link_click"
-
 
 # --- Функции API ---
 
@@ -94,10 +93,6 @@ def analyze_adsets_and_format(campaigns_data: dict):
 # --- Главная функция модуля ---
 
 async def generate_daily_report_text() -> str:
-    """
-    Главная функция, которая собирает данные и генерирует полный текст отчета.
-    Не принимает аргументов, так как сама получает все необходимое.
-    """
     timeout = aiohttp.ClientTimeout(total=240)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         accounts = await get_ad_accounts(session)
@@ -108,7 +103,13 @@ async def generate_daily_report_text() -> str:
         for acc in accounts:
             try:
                 insights = await get_ad_level_insights_for_yesterday(session, acc['account_id'])
+                
+                # --- ВОТ ЭТА СТРОКА ДЛЯ ДИАГНОСТИКИ ---
+                print(f"--- Ответ API для аккаунта {acc.get('name', 'N/A')}: {insights}")
+                # ----------------------------------------
+                
                 if not insights: continue
+                
                 objectives = await get_campaign_objectives(session, acc['account_id'])
                 campaigns_data = structure_insights(insights, objectives)
                 if not campaigns_data: continue
@@ -117,7 +118,7 @@ async def generate_daily_report_text() -> str:
                 account_body = analyze_adsets_and_format(campaigns_data)
                 all_reports.append(account_header + "\n" + account_body)
             except Exception as e:
-                print(f"Ошибка при обработке аккаунта {acc['name']}: {e}")
+                print(f"Ошибка при обработке аккаунта {acc.get('name', 'N/A')}: {e}")
                 continue
 
     if not all_reports:
