@@ -1,4 +1,4 @@
-mport os
+import os
 import asyncio
 import aiohttp
 from aiogram import Bot, Dispatcher, Router, F
