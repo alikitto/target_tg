@@ -1,10 +1,23 @@
+Конечно, вот полный и готовый к использованию код для файла `main.py`.
+
+Он включает в себя все наши последние доработки:
+
+  * **Надежный сбор данных** без "зависаний".
+  * **Выбор периода** для отчёта.
+  * **Детальная статистика** по кампаниям, группам и объявлениям с миниатюрами.
+  * **Новое функциональное меню** вместо стандартной клавиатуры.
+
+Просто скопируйте этот код и полностью замените им содержимое вашего файла `main.py`.
+
+```python
 import os
 import asyncio
 import aiohttp
-import json 
+import json
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, BotCommand, BotCommandScopeDefault
+from aiogram.types import (Message, CallbackQuery, BotCommand, BotCommandScopeDefault,
+                           ReplyKeyboardMarkup, KeyboardButton)
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
@@ -74,16 +87,20 @@ async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id:
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str, ad_ids: list, date_preset: str):
+async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str, ad_ids: list, date_preset: str, time_range: dict = None):
     """Получает статистику для конкретных объявлений за выбранный период."""
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
     params = {
         "fields": "ad_id,spend,actions,ctr",
         "level": "ad",
         "filtering": f'[{{"field":"ad.id","operator":"IN","value":{ad_ids}}}]',
-        "date_preset": date_preset,
         "limit": 1000
     }
+    if time_range:
+        params["time_range"] = json.dumps(time_range)
+    else:
+        params["date_preset"] = date_preset
+        
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
@@ -119,21 +136,33 @@ async def send_and_store(message: Message | CallbackQuery, text: str, *, is_pers
 # ============================
 
 async def set_bot_commands(bot: Bot):
-    """Устанавливает команды в меню Telegram."""
+    """Устанавливает команды в меню Telegram (кнопка слева от поля ввода)."""
     commands = [
-        BotCommand(command="start", description="🚀 Запустить бота / Показать меню"),
-        BotCommand(command="report", description="📊 Отчёт по активным кампаниям"),
+        BotCommand(command="start", description="🚀 Показать главное меню"),
+        BotCommand(command="report", description="📊 Создать новый отчёт"),
         BotCommand(command="clear", description="🧹 Очистить временные сообщения"),
     ]
     await bot.set_my_commands(commands, BotCommandScopeDefault())
 
-def inline_main_menu():
-    """Создаёт инлайн-клавиатуру главного меню."""
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📊 Отчёт: Активные кампании", callback_data="report_period_select")
-    kb.button(text="🧹 Очистить временные сообщения", callback_data="clear_chat")
-    kb.adjust(1)
-    return kb.as_markup()
+def main_reply_menu() -> ReplyKeyboardMarkup:
+    """
+    Создаёт ГЛАВНУЮ функциональную Reply-клавиатуру.
+    """
+    button_report = KeyboardButton(text="📊 Активные кампании")
+    button_daily_summary = KeyboardButton(text="📈 Дневной отчёт")
+    button_ai_recs = KeyboardButton(text="💡 Рекомендации (AI)")
+    button_help = KeyboardButton(text="🆘 Помощь")
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [button_report],
+            [button_daily_summary, button_ai_recs],
+            [button_help]
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие..."
+    )
+    return keyboard
 
 def inline_period_menu():
     """Создаёт инлайн-клавиатуру для выбора периода отчёта."""
@@ -143,8 +172,7 @@ def inline_period_menu():
     kb.button(text="За 7 дней", callback_data="build_report:last_7d")
     kb.button(text="За 30 дней", callback_data="build_report:last_30d")
     kb.button(text="С 1 июня 2025", callback_data="build_report:from_june_1")
-    kb.button(text="🔙 Назад в меню", callback_data="show_menu")
-    kb.adjust(2, 2, 1, 1)
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 # ============================
@@ -153,30 +181,44 @@ def inline_period_menu():
 
 @router.message(Command("start", "restart"))
 async def start_handler(msg: Message):
-    """Обработчик команды /start, показывает главное меню."""
-    await send_and_store(msg, "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:", is_persistent=True, reply_markup=inline_main_menu())
+    """Обработчик команды /start. Отправляет приветствие и показывает ГЛАВНОЕ меню."""
+    await msg.answer(
+        "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:",
+        reply_markup=main_reply_menu()
+    )
 
-@router.callback_query(F.data == "show_menu")
-async def show_menu_handler(call: CallbackQuery):
-    """Показывает главное меню, редактируя существующее сообщение."""
-    await call.message.edit_text("👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:", reply_markup=inline_main_menu())
+@router.message(F.text == "📊 Активные кампании")
+async def report_period_select_handler(message: Message):
+    """Реагирует на кнопку "Активные кампании" и предлагает выбрать период."""
+    await message.answer("🗓️ Выберите период для отчёта:", reply_markup=inline_period_menu())
 
-@router.callback_query(F.data == "report_period_select")
-async def report_period_select_handler(call: CallbackQuery):
-    """Показывает меню выбора периода для отчёта."""
-    await call.message.edit_text("🗓️ Выберите период для отчёта:", reply_markup=inline_period_menu())
+@router.message(F.text == "🆘 Помощь")
+async def help_handler(message: Message):
+    """Реагирует на кнопку "Помощь" и выводит справку."""
+    help_text = (
+        "<b>ℹ️ Справка по боту:</b>\n\n"
+        "● <b>📊 Активные кампании</b> - формирует детальный отчёт по всем активным кампаниям за выбранный период.\n\n"
+        "● <b>/clear</b> - команда для удаления всех временных сообщений (отчётов, статусов загрузки).\n\n"
+        "● <b>📈 Дневной отчёт</b> и <b>💡 Рекомендации (AI)</b> - функции в разработке."
+    )
+    await message.answer(help_text)
 
+@router.message(F.text.in_({"📈 Дневной отчёт", "💡 Рекомендации (AI)"}))
+async def future_functions_handler(message: Message):
+    """Реагирует на кнопки функций, которые находятся в разработке."""
+    await message.answer(f"Вы выбрали: {message.text}\n\nЭтот функционал будет добавлен в следующих версиях бота.")
 
 @router.message(Command("clear"))
-@router.callback_query(F.data == "clear_chat")
-async def clear_chat_handler(event: Message | CallbackQuery):
-    """Удаляет все временные сообщения, оставяляя постоянные (меню)."""
-    message = event.message if isinstance(event, CallbackQuery) else event
+async def clear_chat_command_handler(message: Message):
+    """Обрабатывает команду /clear."""
+    await clear_chat_logic(message)
+
+async def clear_chat_logic(message: Message):
+    """Удаляет все временные сообщения."""
     chat_id = message.chat.id
     
     if chat_id in sent_messages_by_chat and sent_messages_by_chat[chat_id]:
         messages_to_delete = [msg_info["id"] for msg_info in sent_messages_by_chat[chat_id] if not msg_info.get("persistent")]
-        # Оставляем только постоянные сообщения
         sent_messages_by_chat[chat_id] = [msg_info for msg_info in sent_messages_by_chat[chat_id] if msg_info.get("persistent")]
         
         count = 0
@@ -185,7 +227,7 @@ async def clear_chat_handler(event: Message | CallbackQuery):
                 await bot.delete_message(chat_id, msg_id)
                 count += 1
             except TelegramBadRequest:
-                pass # Игнорируем ошибки, если сообщение уже удалено
+                pass
         
         status_msg = await message.answer(f"✅ Готово! Удалил {count} временных сообщений.")
         await asyncio.sleep(3)
@@ -195,30 +237,24 @@ async def clear_chat_handler(event: Message | CallbackQuery):
         await asyncio.sleep(3)
         await bot.delete_message(chat_id, status_msg.message_id)
 
-    if isinstance(event, CallbackQuery):
-        # Если это было нажатие кнопки, просто скрываем её
-        await event.answer()
-
-
 # ============ Отчёт с лоадером ============
 @router.callback_query(F.data.startswith("build_report:"))
 async def build_report_handler(call: CallbackQuery):
     """Основной хендлер для построения отчёта."""
     date_preset = call.data.split(":")[1]
+    time_range = None
     
-    # Для кастомной даты "С 1 июня 2025"
     if date_preset == "from_june_1":
         start_date = "2025-06-01"
         end_date = datetime.now().strftime('%Y-%m-%d')
-        time_range = f'{{"since":"{start_date}","until":"{end_date}"}}'
+        time_range = {"since": start_date, "until": end_date}
+        await call.message.edit_text(f"⏳ Начинаю сбор данных с <b>{start_date}</b> по <b>{end_date}</b>...")
     else:
-        time_range = None # Используем стандартные date_preset
+        await call.message.edit_text(f"⏳ Начинаю сбор данных за период: <b>{date_preset}</b>...")
 
-    await call.message.edit_text(f"⏳ Начинаю сбор данных за период: <b>{date_preset}</b>...")
     status_msg = await send_and_store(call, "Подключаюсь к API...")
-
     all_accounts_data = {}
-    timeout = aiohttp.ClientTimeout(total=180) # Увеличим общий таймаут
+    timeout = aiohttp.ClientTimeout(total=180)
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -250,22 +286,7 @@ async def build_report_handler(call: CallbackQuery):
                     ad_ids = [ad['id'] for ad in ads]
                     await status_msg.edit_text(base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
                     
-                    # Передаем правильный параметр в функцию
-                    insights_params = {"account_id": acc["account_id"], "ad_ids": ad_ids}
-                    if time_range:
-                        insights_params["date_preset"] = None # Не используем preset если есть time_range
-                        # Добавляем time_range в сам запрос внутри функции
-                        url = f"https://graph.facebook.com/{API_VERSION}/act_{acc['account_id']}/insights"
-                        params = {
-                            "fields": "ad_id,spend,actions,ctr", "level": "ad",
-                            "filtering": f'[{{"field":"ad.id","operator":"IN","value":{ad_ids}}}]',
-                            "time_range": time_range, "limit": 1000
-                        }
-                        insights_data = await fb_get(session, url, params)
-                        insights = insights_data.get("data", [])
-                    else:
-                        insights_params["date_preset"] = date_preset
-                        insights = await get_ad_level_insights(session, **insights_params)
+                    insights = await get_ad_level_insights(session, acc["account_id"], ad_ids, date_preset, time_range)
 
                     insights_map = {}
                     for row in insights:
@@ -346,13 +367,12 @@ async def build_report_handler(call: CallbackQuery):
     if not all_accounts_data:
         await status_msg.edit_text("✅ Активных кампаний с затратами за выбранный период не найдено.")
         await asyncio.sleep(5)
-        await show_menu_handler(call)
+        await call.message.delete()
         return
     
     try: await bot.delete_message(status_msg.chat.id, status_msg.message_id)
     except TelegramBadRequest: pass
 
-    # Форматирование и отправка отчёта
     for acc_name, campaigns_data in all_accounts_data.items():
         active_campaign_count = len(campaigns_data)
         msg_lines = [
@@ -369,28 +389,30 @@ async def build_report_handler(call: CallbackQuery):
                 
                 adset_block = [f"  <b>↳ Группа:</b> <code>{adset_data['name']}</code>"]
                 
-                # Общая статистика для группы
-                if "TRAFFIC" in adset_data['ads'][0]["objective"]:
+                if adset_data['ads'] and "TRAFFIC" in adset_data['ads'][0]["objective"]:
                     total_clicks = sum(ad['clicks'] for ad in adset_data['ads'])
                     total_cpc = (total_spend / total_clicks) if total_clicks > 0 else 0
-                    adset_block.append(f"    - <b>Цель:</b> {camp_data['objective']}")
-                    adset_block.append(f"    - <b>Клики:</b> {total_clicks}")
-                    adset_block.append(f"    - <b>Расход:</b> ${total_spend:.2f}")
-                    adset_block.append(f"    - <b>CPC:</b> ${total_cpc:.2f} {cpl_label(total_cpc, 'cpc')}")
+                    adset_block.extend([
+                        f"    - <b>Цель:</b> {camp_data['objective']}",
+                        f"    - <b>Клики:</b> {total_clicks}",
+                        f"    - <b>Расход:</b> ${total_spend:.2f}",
+                        f"    - <b>CPC:</b> ${total_cpc:.2f} {cpl_label(total_cpc, 'cpc')}"
+                    ])
                 else:
-                    total_leads = sum(ad['leads'] for ad in adset_data['ads'])
+                    total_leads = sum(ad.get('leads', 0) for ad in adset_data['ads'])
                     total_cpl = (total_spend / total_leads) if total_leads > 0 else 0
-                    adset_block.append(f"    - <b>Цель:</b> {camp_data['objective']}")
-                    adset_block.append(f"    - <b>Лиды:</b> {total_leads}")
-                    adset_block.append(f"    - <b>Расход:</b> ${total_spend:.2f}")
-                    adset_block.append(f"    - <b>CPL:</b> ${total_cpl:.2f} {cpl_label(total_cpl, 'cpl')}")
+                    adset_block.extend([
+                        f"    - <b>Цель:</b> {camp_data['objective']}",
+                        f"    - <b>Лиды:</b> {total_leads}",
+                        f"    - <b>Расход:</b> ${total_spend:.2f}",
+                        f"    - <b>CPL:</b> ${total_cpl:.2f} {cpl_label(total_cpl, 'cpl')}"
+                    ])
 
                 msg_lines.extend(adset_block)
                 
                 if adset_data['ads']:
                     msg_lines.append("  <b>↳ Объявления:</b>")
                     
-                    # Сортировка в зависимости от цели
                     sort_key = 'cpc' if "TRAFFIC" in adset_data['ads'][0]["objective"] else 'cpl'
                     sorted_ads = sorted(adset_data['ads'], key=lambda x: x.get(sort_key, float('inf')))
 
@@ -402,17 +424,14 @@ async def build_report_handler(call: CallbackQuery):
                             ad_line = f'    <a href="{thumb_url}">🖼️</a> <b>{ad["name"]}</b> | CPL: ${ad["cpl"]:.2f} | CTR: {ad["ctr"]:.2f}%'
                         msg_lines.append(ad_line)
 
-        # Отправляем одним большим сообщением для каждого аккаунта
         final_report = "\n".join(msg_lines)
-        # Разбиваем на части, если сообщение слишком длинное
         if len(final_report) > 4096:
             for x in range(0, len(final_report), 4096):
                 await send_and_store(call, final_report[x:x+4096])
         else:
             await send_and_store(call, final_report)
 
-    # Возвращаем главное меню в исходное сообщение
-    await call.message.edit_text("✅ Отчёт завершён. Выберите следующее действие:", reply_markup=inline_main_menu())
+    await call.message.edit_text("✅ Отчёт завершён.")
 
 
 # ============================
@@ -431,3 +450,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("Бот остановлен вручную.")
+
+```
