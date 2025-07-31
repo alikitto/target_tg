@@ -1,7 +1,6 @@
 import os
 import asyncio
 import requests
-from datetime import date
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
@@ -16,7 +15,7 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# === Graph API helper ===
+# ================= Graph API helpers =================
 def fb_get(url, params=None):
     if not params:
         params = {}
@@ -25,25 +24,21 @@ def fb_get(url, params=None):
     r.raise_for_status()
     return r.json()
 
-# === Получение всех аккаунтов ===
 def get_ad_accounts():
     url = "https://graph.facebook.com/v19.0/me/adaccounts"
     data = fb_get(url, {"fields": "name,account_id"})
     return data.get("data", [])
 
-# === Получение всех adset текущего аккаунта ===
-def get_all_adsets(account_id):
-    url = f"https://graph.facebook.com/v19.0/act_{account_id}/adsets"
-    params = {"fields": "id,name,campaign_id,status", "limit": 500}
-    return fb_get(url, params).get("data", [])
-
-# === Получение кампаний ===
 def get_campaigns(account_id):
     url = f"https://graph.facebook.com/v19.0/act_{account_id}/campaigns"
     params = {"fields": "id,name,status,objective", "limit": 500}
     return fb_get(url, params).get("data", [])
 
-# === Insights для CPL и сообщений ===
+def get_all_adsets(account_id):
+    url = f"https://graph.facebook.com/v19.0/act_{account_id}/adsets"
+    params = {"fields": "id,name,campaign_id,status", "limit": 500}
+    return fb_get(url, params).get("data", [])
+
 def get_adset_insights(account_id, adset_ids):
     url = f"https://graph.facebook.com/v19.0/act_{account_id}/insights"
     params = {
@@ -54,19 +49,29 @@ def get_adset_insights(account_id, adset_ids):
     }
     return fb_get(url, params).get("data", [])
 
-# === Прогресс-бар ===
+def get_ad_creatives(adset_id):
+    url = f"https://graph.facebook.com/v19.0/{adset_id}/ads"
+    params = {"fields": "creative{thumbnail_url}", "limit": 5}
+    data = fb_get(url, params).get("data", [])
+    thumbs = []
+    for ad in data:
+        thumb = ad.get("creative", {}).get("thumbnail_url")
+        if thumb:
+            thumbs.append(thumb)
+    return thumbs
+
+# ================= Progress bar =================
 def progress_bar(current, total, length=20):
     filled = int(length * current // total)
     return "▓" * filled + "░" * (length - filled)
 
-# === /start ===
+# ================= Bot Handlers =================
 @router.message(Command("start"))
 async def start_handler(msg: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="Собрать отчёт", callback_data="build_report")
     await msg.answer("Привет! Нажми кнопку, чтобы собрать отчёт по активным кампаниям.", reply_markup=kb.as_markup())
 
-# === Основная логика ===
 @router.callback_query(lambda c: c.data == "build_report")
 async def build_report(callback: CallbackQuery):
     status_msg = await callback.message.answer("Начинаю сбор данных…")
@@ -77,24 +82,25 @@ async def build_report(callback: CallbackQuery):
         await status_msg.edit_text("Нет рекламных аккаунтов.")
         return
 
-    report_lines_all = []
+    active_accounts_data = []
+
+    # ===== Обработка каждого аккаунта =====
     for i, acc in enumerate(accounts, start=1):
         bar = progress_bar(i, len(accounts))
         await status_msg.edit_text(f"{bar}\nОбработка {i}/{len(accounts)}: {acc['name']}")
 
-        # === Получаем кампании и adsets ===
         campaigns = get_campaigns(acc["account_id"])
         active_campaigns = {c["id"]: c for c in campaigns if c.get("status") == "ACTIVE"}
         adsets = get_all_adsets(acc["account_id"])
         active_adsets = [a for a in adsets if a.get("status") == "ACTIVE" and a.get("campaign_id") in active_campaigns]
 
         if not active_adsets:
-            report_lines_all.append(f"--- {acc['name']} --- Нет активных кампаний.")
-            continue
+            continue  # Пропускаем аккаунт без активных кампаний
 
-        # === Insights по активным adsets ===
+        # Получаем инсайты
         adset_ids = [a["id"] for a in active_adsets]
         insights = get_adset_insights(acc["account_id"], adset_ids)
+
         spend_map = {}
         chats_map = {}
         for row in insights:
@@ -107,25 +113,62 @@ async def build_report(callback: CallbackQuery):
             spend_map[adset_id] = spend
             chats_map[adset_id] = chats
 
-        # === Формируем отчёт ===
-        report_lines_all.append(f"--- {acc['name']} ---")
+        # Группируем по кампаниям
+        campaigns_data = {}
         for ad in active_adsets:
-            spend = spend_map.get(ad["id"], 0)
-            chats = chats_map.get(ad["id"], 0)
-            cpl = (spend / chats) if chats > 0 else 0
-            campaign = active_campaigns.get(ad["campaign_id"], {})
-            report_lines_all.append(
-                f"{campaign.get('name','')} | {ad['name']} | "
-                f"Статус: {ad.get('status')} | Цель: {campaign.get('objective','')} | "
-                f"Лидов: {chats} | CPL: ${cpl:.2f} | Расход: ${spend:.2f}"
-            )
+            camp_id = ad["campaign_id"]
+            campaign = active_campaigns.get(camp_id)
+            if not campaign:
+                continue
+
+            cpl = (spend_map.get(ad["id"], 0) / chats_map.get(ad["id"], 1)) if chats_map.get(ad["id"], 0) > 0 else 0
+            ad_data = {
+                "name": ad["name"],
+                "objective": campaign.get("objective", ""),
+                "cpl": cpl,
+                "leads": chats_map.get(ad["id"], 0),
+                "spend": spend_map.get(ad["id"], 0),
+                "thumbs": get_ad_creatives(ad["id"])
+            }
+            if camp_id not in campaigns_data:
+                campaigns_data[camp_id] = {"name": campaign["name"], "adsets": []}
+            campaigns_data[camp_id]["adsets"].append(ad_data)
+
+        active_accounts_data.append({
+            "name": acc["name"],
+            "campaigns": list(campaigns_data.values()),
+            "active_count": len(campaigns_data)
+        })
+
         await asyncio.sleep(0.5)
 
+    # ===== Формируем красивый отчёт =====
+    if not active_accounts_data:
+        await status_msg.edit_text("Активных кампаний не найдено.")
+        return
+
+    output = [f"📊 Активных рекламных кабинетов: {len(active_accounts_data)}"]
+    for acc in active_accounts_data:
+        output.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        output.append(f"🏢 Рекл. кабинет: {acc['name']}")
+        output.append(f"📈 Активных кампаний: {acc['active_count']}\n")
+        for camp in acc["campaigns"]:
+            output.append(f"🎯 Кампания: {camp['name']}")
+            for ad in camp["adsets"]:
+                output.append(
+                    f"• Ad Set: {ad['name']}\n"
+                    f"   Цель: {ad['objective']} | CPL: ${ad['cpl']:.2f} | "
+                    f"Лиды: {ad['leads']} | Расход: ${ad['spend']:.2f}"
+                )
+                if ad["thumbs"]:
+                    output.append("   Миниатюры:\n   " + "\n   ".join(ad["thumbs"]))
+            output.append("")  # Пустая строка для читаемости
+
     await status_msg.edit_text("Отчёт готов. Отправляю данные…")
-    await callback.message.answer("\n".join(report_lines_all))
+    await callback.message.answer("\n".join(output))
     await status_msg.edit_text("Готово ✅")
 
-# === Запуск ===
+# ================= Run =================
 dp.include_router(router)
 async def main():
     await dp.start_polling(bot)
