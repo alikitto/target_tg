@@ -34,13 +34,6 @@ async def fb_get(session: aiohttp.ClientSession, url: str, params: dict = None):
         response.raise_for_status()
         return await response.json()
 
-async def fb_post(session: aiohttp.ClientSession, url: str, params: dict = None):
-    params = params or {}
-    params["access_token"] = META_TOKEN
-    async with session.post(url, params=params) as response:
-        response.raise_for_status()
-        return await response.json()
-
 async def get_ad_accounts(session: aiohttp.ClientSession):
     url = f"https://graph.facebook.com/{API_VERSION}/me/adaccounts"
     params = {"fields": "name,account_id"}
@@ -66,10 +59,9 @@ async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id:
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-# ### ИЗМЕНЕНИЕ: Гибридный подход. Две функции для получения статистики.
-
-async def get_ad_level_insights_sync(session: aiohttp.ClientSession, account_id: str, ad_ids: list, start_date: str):
-    """Получает статистику СИНХРОННО (быстро) для коротких периодов."""
+# ### ИЗМЕНЕНИЕ: Возвращена одна простая, синхронная функция для статистики
+async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str, ad_ids: list, start_date: str):
+    """Получает статистику СИНХРОННО (быстро и надежно)."""
     end_date = datetime.now().strftime("%Y-%m-%d")
     ad_ids_json_string = json.dumps(ad_ids)
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
@@ -82,40 +74,6 @@ async def get_ad_level_insights_sync(session: aiohttp.ClientSession, account_id:
     }
     data = await fb_get(session, url, params)
     return data.get("data", [])
-
-async def start_async_insights_job(session: aiohttp.ClientSession, account_id: str, ad_ids: list, start_date: str):
-    """Запускает АСИНХРОННЫЙ отчет (надежно) для длинных периодов."""
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    ad_ids_json_string = json.dumps(ad_ids)
-    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
-    params = {
-        "fields": json.dumps(["ad_id", "spend", "actions", "ctr", "link_clicks"]),
-        "level": "ad",
-        "filtering": f'[{{"field":"ad.id","operator":"IN","value":{ad_ids_json_string}}}]',
-        "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
-    }
-    response = await fb_post(session, url, params=params)
-    return response.get('report_run_id')
-
-async def check_async_job_status(session: aiohttp.ClientSession, report_run_id: str):
-    url = f"https://graph.facebook.com/{API_VERSION}/{report_run_id}"
-    params = {"fields": "async_status,async_percent_completion"}
-    return await fb_get(session, url, params=params)
-
-async def get_async_job_results(session: aiohttp.ClientSession, report_run_id: str):
-    url = f"https://graph.facebook.com/{API_VERSION}/{report_run_id}/insights"
-    params = {"limit": 1000}
-    all_results = []
-    response = await fb_get(session, url, params=params)
-    all_results.extend(response.get("data", []))
-    next_page_url = response.get("paging", {}).get("next")
-    while next_page_url:
-        async with session.get(next_page_url) as next_response:
-            next_response.raise_for_status()
-            paged_data = await next_response.json()
-            all_results.extend(paged_data.get("data", []))
-            next_page_url = paged_data.get("paging", {}).get("next")
-    return all_results
 
 # ============================
 # ===      Помощники       ===
@@ -227,16 +185,12 @@ async def build_report(call: CallbackQuery):
     today = datetime.now()
     if period == 'today':
         start_date = today.strftime("%Y-%m-%d")
-        use_async = False
     elif period == 'week':
         start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
-        use_async = False
     elif period == 'month':
         start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
-        use_async = True
     else: # all_time
         start_date = "2025-06-01"
-        use_async = True
 
     await update_panel(chat_id, "⏳ Начинаю сбор данных...")
     all_accounts_data = {}
@@ -270,33 +224,9 @@ async def build_report(call: CallbackQuery):
                     if not ads: continue
                     
                     ad_ids = [ad['id'] for ad in ads]
-                    insights = []
-
-                    # ### ИЗМЕНЕНИЕ: Выбираем метод получения статистики
-                    if use_async:
-                        await update_panel(chat_id, base_text + f" Запускаю асинхронный отчет для {len(ad_ids)} объявлений...")
-                        report_run_id = await start_async_insights_job(session, acc["account_id"], ad_ids, start_date)
-                        if not report_run_id:
-                            msg = await bot.send_message(chat_id, f"⚠️ Не удалось запустить отчет для кабинета <b>{acc['name']}</b>.")
-                            await store_message_id(chat_id, msg.message_id)
-                            continue
-                        
-                        while True:
-                            status_data = await check_async_job_status(session, report_run_id)
-                            status = status_data.get('async_status')
-                            percent = status_data.get('async_percent_completion', 0)
-                            await update_panel(chat_id, base_text + f" Отчет готовится: {percent}%...")
-                            if status == 'Job Completed':
-                                insights = await get_async_job_results(session, report_run_id)
-                                break
-                            elif status == 'Job Failed':
-                                msg = await bot.send_message(chat_id, f"❌ Отчет для кабинета <b>{acc['name']}</b> не удался.")
-                                await store_message_id(chat_id, msg.message_id)
-                                break
-                            await asyncio.sleep(10)
-                    else:
-                        await update_panel(chat_id, base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
-                        insights = await get_ad_level_insights_sync(session, acc["account_id"], ad_ids, start_date)
+                    
+                    await update_panel(chat_id, base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
+                    insights = await get_ad_level_insights(session, acc["account_id"], ad_ids, start_date)
 
                     if not insights: continue
 
