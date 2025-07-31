@@ -22,8 +22,6 @@ bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 router = Router()
 
-# ### ИЗМЕНЕНИЕ: Словарь для хранения ID сообщений и главного "пульта"
-# Ключ - chat_id, значение - словарь с 'messages' и 'panel_id'
 chat_sessions = {}
 
 # ============================
@@ -33,6 +31,13 @@ async def fb_get(session: aiohttp.ClientSession, url: str, params: dict = None):
     params = params or {}
     params["access_token"] = META_TOKEN
     async with session.get(url, params=params) as response:
+        response.raise_for_status()
+        return await response.json()
+
+async def fb_post(session: aiohttp.ClientSession, url: str, params: dict = None):
+    params = params or {}
+    params["access_token"] = META_TOKEN
+    async with session.post(url, params=params) as response:
         response.raise_for_status()
         return await response.json()
 
@@ -56,56 +61,67 @@ async def get_all_adsets(session: aiohttp.ClientSession, account_id: str):
 
 async def get_all_ads_with_creatives(session: aiohttp.ClientSession, account_id: str, active_adset_ids: list):
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/ads"
-    filtering = [
-        {'field': 'adset.id', 'operator': 'IN', 'value': active_adset_ids},
-        {'field': 'effective_status', 'operator': 'IN', 'value': ['ACTIVE']}
-    ]
-    params = {
-        "fields": "id,name,adset_id,campaign_id,creative{thumbnail_url}",
-        "filtering": json.dumps(filtering),
-        "limit": 1000
-    }
+    filtering = [{'field': 'adset.id', 'operator': 'IN', 'value': active_adset_ids}, {'field': 'effective_status', 'operator': 'IN', 'value': ['ACTIVE']}]
+    params = {"fields": "id,name,adset_id,campaign_id,creative{thumbnail_url}", "filtering": json.dumps(filtering), "limit": 1000}
     data = await fb_get(session, url, params)
     return data.get("data", [])
 
-# ### ИЗМЕНЕНИЕ: Запрашиваем клики для расчета CPC
-async def get_ad_level_insights(session: aiohttp.ClientSession, account_id: str, ad_ids: list):
+# ### ИЗМЕНЕНИЕ: Функции для асинхронных отчетов
+async def start_async_insights_job(session: aiohttp.ClientSession, account_id: str, ad_ids: list):
+    """Отправляет запрос на создание отчета в фоновом режиме."""
     start_date = "2025-06-01"
     end_date = datetime.now().strftime("%Y-%m-%d")
     ad_ids_json_string = json.dumps(ad_ids)
     url = f"https://graph.facebook.com/{API_VERSION}/act_{account_id}/insights"
     params = {
-        "fields": "ad_id,spend,actions,ctr,link_clicks", # Добавили link_clicks
+        "fields": json.dumps(["ad_id", "spend", "actions", "ctr", "link_clicks"]),
         "level": "ad",
         "filtering": f'[{{"field":"ad.id","operator":"IN","value":{ad_ids_json_string}}}]',
         "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
-        "limit": 1000
     }
-    data = await fb_get(session, url, params)
-    return data.get("data", [])
+    response = await fb_post(session, url, params=params)
+    return response.get('report_run_id')
+
+async def check_async_job_status(session: aiohttp.ClientSession, report_run_id: str):
+    """Проверяет статус готовности отчета."""
+    url = f"https://graph.facebook.com/{API_VERSION}/{report_run_id}"
+    params = {"fields": "async_status,async_percent_completion"}
+    return await fb_get(session, url, params=params)
+
+async def get_async_job_results(session: aiohttp.ClientSession, report_run_id: str):
+    """Получает результаты завершенного асинхронного отчета."""
+    url = f"https://graph.facebook.com/{API_VERSION}/{report_run_id}/insights"
+    params = {"limit": 1000}
+    all_results = []
+    response = await fb_get(session, url, params=params)
+    all_results.extend(response.get("data", []))
+    next_page_url = response.get("paging", {}).get("next")
+    while next_page_url:
+        async with session.get(next_page_url) as next_response:
+            next_response.raise_for_status()
+            paged_data = await next_response.json()
+            all_results.extend(paged_data.get("data", []))
+            next_page_url = paged_data.get("paging", {}).get("next")
+    return all_results
 
 # ============================
 # ===      Помощники       ===
 # ============================
 def get_session(chat_id: int):
-    """Получает или создает сессию для чата."""
     if chat_id not in chat_sessions:
         chat_sessions[chat_id] = {"messages": [], "panel_id": None}
     return chat_sessions[chat_id]
 
 def metric_label(value: float) -> str:
-    """Универсальная метка для CPL/CPC."""
     if value <= 1: return "🟢 Дешёвый"
     if value <= 3: return "🟡 Средний"
     return "🔴 Дорогой"
 
 async def store_message_id(chat_id: int, message_id: int):
-    """Сохраняет ID временного сообщения."""
     session = get_session(chat_id)
     session["messages"].append(message_id)
 
 async def update_panel(chat_id: int, text: str, **kwargs):
-    """Обновляет или создает главную панель управления."""
     session = get_session(chat_id)
     panel_id = session.get("panel_id")
     try:
@@ -116,11 +132,9 @@ async def update_panel(chat_id: int, text: str, **kwargs):
             session["panel_id"] = msg.message_id
     except TelegramBadRequest as e:
         if "message to edit not found" in e.message or "message is not modified" in e.message:
-            # Если старую панель не нашли (удалили вручную), создаем новую
             msg = await bot.send_message(chat_id, text, **kwargs)
             session["panel_id"] = msg.message_id
         else:
-            # Другие ошибки (например, неправильный HTML) пробрасываем дальше
             raise e
 
 # ============================
@@ -161,7 +175,6 @@ async def clear_chat_handler(event: Message | CallbackQuery):
     session = get_session(chat_id)
     messages_to_delete = session["messages"].copy()
     session["messages"] = []
-    
     count = 0
     for msg_id in messages_to_delete:
         try:
@@ -169,22 +182,18 @@ async def clear_chat_handler(event: Message | CallbackQuery):
             count += 1
         except TelegramBadRequest:
             pass
-    
     confirmation_text = f"✅ Готово! Удалил {count} временных сообщений."
     menu_text = "👋 Привет! Я твой бот для управления рекламой.\n\nВыберите действие:"
     await update_panel(chat_id, menu_text, reply_markup=inline_main_menu())
-    
     if isinstance(event, CallbackQuery):
         await event.answer(confirmation_text, show_alert=True)
     else:
-        # Отправляем и сразу сохраняем для удаления
         msg = await event.answer(confirmation_text)
         await asyncio.sleep(5)
         try:
             await bot.delete_message(chat_id, msg.message_id)
         except TelegramBadRequest:
             pass
-
 
 # ============ Отчёт с лоадером ============
 @router.message(Command("report"))
@@ -194,7 +203,7 @@ async def build_report(event: Message | CallbackQuery):
     await update_panel(chat_id, "⏳ Начинаю сбор данных...")
     all_accounts_data = {}
     
-    timeout = aiohttp.ClientTimeout(total=120)
+    timeout = aiohttp.ClientTimeout(total=300) # Увеличим общий таймаут на всякий случай
     
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -223,17 +232,40 @@ async def build_report(event: Message | CallbackQuery):
                     if not ads: continue
                     
                     ad_ids = [ad['id'] for ad in ads]
-                    await update_panel(chat_id, base_text + f" Cкачиваю статистику для {len(ad_ids)} объявлений...")
-                    insights = await get_ad_level_insights(session, acc["account_id"], ad_ids)
+                    await update_panel(chat_id, base_text + f" Запускаю асинхронный отчет для {len(ad_ids)} объявлений...")
+                    report_run_id = await start_async_insights_job(session, acc["account_id"], ad_ids)
+
+                    if not report_run_id:
+                        msg = await bot.send_message(chat_id, f"⚠️ Не удалось запустить отчет для кабинета <b>{acc['name']}</b>.")
+                        await store_message_id(chat_id, msg.message_id)
+                        continue
+
+                    insights = []
+                    while True:
+                        status_data = await check_async_job_status(session, report_run_id)
+                        status = status_data.get('async_status')
+                        percent = status_data.get('async_percent_completion', 0)
+                        await update_panel(chat_id, base_text + f" Отчет готовится: {percent}%...")
+                        if status == 'Job Completed':
+                            insights = await get_async_job_results(session, report_run_id)
+                            break
+                        elif status == 'Job Failed':
+                            msg = await bot.send_message(chat_id, f"❌ Отчет для кабинета <b>{acc['name']}</b> не удался.")
+                            await store_message_id(chat_id, msg.message_id)
+                            break
+                        await asyncio.sleep(15)
                     
+                    if not insights: continue
+
                     insights_map = {}
                     for row in insights:
                         ad_id = row['ad_id']
-                        spend = float(row.get("spend", 0))
-                        leads = sum(int(a["value"]) for a in row.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE)
-                        clicks = int(row.get("link_clicks", 0))
-                        ctr = float(row.get("ctr", 0))
-                        insights_map[ad_id] = {"spend": spend, "leads": leads, "clicks": clicks, "ctr": ctr}
+                        insights_map[ad_id] = {
+                            "spend": float(row.get("spend", 0)),
+                            "leads": sum(int(a["value"]) for a in row.get("actions", []) if a.get("action_type") == LEAD_ACTION_TYPE),
+                            "clicks": int(row.get("link_clicks", 0)),
+                            "ctr": float(row.get("ctr", 0))
+                        }
 
                     account_data = {}
                     for ad in ads:
@@ -244,19 +276,12 @@ async def build_report(event: Message | CallbackQuery):
                         
                         if campaign_id not in account_data:
                             campaign_obj = campaigns_map[campaign_id]
-                            account_data[campaign_id] = {
-                                "name": campaign_obj['name'],
-                                "objective_raw": campaign_obj.get("objective", "N/A"),
-                                "adsets": {}
-                            }
+                            account_data[campaign_id] = {"name": campaign_obj['name'], "objective_raw": campaign_obj.get("objective", "N/A"), "adsets": {}}
                         
                         if adset_id not in account_data[campaign_id]['adsets']:
                             account_data[campaign_id]['adsets'][adset_id] = {"name": adsets_map[adset_id]['name'], "ads": []}
                         
-                        ad_info = {
-                            "name": ad['name'], "thumbnail_url": ad.get('creative', {}).get('thumbnail_url'),
-                            "ctr": stats['ctr'], "leads": stats['leads'], "clicks": stats['clicks'], "spend": stats['spend']
-                        }
+                        ad_info = {"name": ad['name'], "thumbnail_url": ad.get('creative', {}).get('thumbnail_url'), **stats}
                         account_data[campaign_id]['adsets'][adset_id]['ads'].append(ad_info)
 
                     if account_data: all_accounts_data[acc['name']] = account_data
@@ -281,7 +306,6 @@ async def build_report(event: Message | CallbackQuery):
         await update_panel(chat_id, "✅ Активных кампаний с затратами или лидами не найдено.", reply_markup=inline_main_menu())
         return
     
-    # Отправляем отчеты в отдельных сообщениях
     for acc_name, campaigns_data in all_accounts_data.items():
         active_campaign_count = len(campaigns_data)
         msg_lines = [f"<b>🏢 Рекламный кабинет:</b> <u>{acc_name}</u>", f"<b>📈 Активных кампаний:</b> {active_campaign_count}", "─" * 20]
@@ -293,41 +317,34 @@ async def build_report(event: Message | CallbackQuery):
             
             for adset_id, adset_data in camp_data['adsets'].items():
                 total_spend = sum(ad['spend'] for ad in adset_data['ads'])
-                
                 if is_traffic:
                     total_metric_val = sum(ad['clicks'] for ad in adset_data['ads'])
                     total_cost_per_action = (total_spend / total_metric_val) if total_metric_val > 0 else 0
-                    metric_name = "Клики"
-                    cost_name = "CPC"
+                    metric_name, cost_name = "Клики", "CPC"
                 else:
                     total_metric_val = sum(ad['leads'] for ad in adset_data['ads'])
                     total_cost_per_action = (total_spend / total_metric_val) if total_metric_val > 0 else 0
-                    metric_name = "Лиды"
-                    cost_name = "CPL"
+                    metric_name, cost_name = "Лиды", "CPL"
 
-                adset_block = [
+                msg_lines.extend([
                     f"  <b>↳ Группа:</b> <code>{adset_data['name']}</code>",
                     f"    - <b>Цель:</b> {objective_clean}",
                     f"    - <b>{metric_name}:</b> {total_metric_val}",
                     f"    - <b>Расход:</b> ${total_spend:.2f}",
                     f"    - <b>{cost_name}:</b> ${total_cost_per_action:.2f} {metric_label(total_cost_per_action)}"
-                ]
-                msg_lines.extend(adset_block)
+                ])
                 
                 if adset_data['ads']:
                     msg_lines.append("  <b>↳ Объявления:</b>")
                     for ad in sorted(adset_data['ads'], key=lambda x: x['spend'], reverse=True):
                         thumb_url = ad.get('thumbnail_url', '#')
-                        
                         if is_traffic:
                             ad_cost_per_action = (ad['spend'] / ad['clicks']) if ad['clicks'] > 0 else 0
                             ad_cost_name = "CPC"
                         else:
                             ad_cost_per_action = (ad['spend'] / ad['leads']) if ad['leads'] > 0 else 0
                             ad_cost_name = "CPL"
-
-                        ad_line = f'    <a href="{thumb_url}">🖼️</a> <b>{ad["name"]}</b> | {ad_cost_name}: ${ad_cost_per_action:.2f} | CTR: {ad["ctr"]:.2f}%'
-                        msg_lines.append(ad_line)
+                        msg_lines.append(f'    <a href="{thumb_url}">🖼️</a> <b>{ad["name"]}</b> | {ad_cost_name}: ${ad_cost_per_action:.2f} | CTR: {ad["ctr"]:.2f}%')
         
         report_msg = await bot.send_message(chat_id, "\n".join(msg_lines), parse_mode="HTML", disable_web_page_preview=True)
         await store_message_id(chat_id, report_msg.message_id)
