@@ -451,4 +451,3 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         print("Бот остановлен вручную.")
 
-```
